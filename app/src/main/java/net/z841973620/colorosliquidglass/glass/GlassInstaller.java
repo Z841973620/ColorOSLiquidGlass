@@ -155,6 +155,10 @@ public final class GlassInstaller {
         // suppressed preserves non-uniform folder icon shapes.
         float[] liveRadii = readCornerRadii(view);
         if (liveRadii != null) return liveRadii;
+        Object pressRadius = readField(view, "mDrawableRadius");
+        if (pressRadius instanceof Number && ((Number) pressRadius).floatValue() > 0f) {
+            return uniformRadii(((Number) pressRadius).floatValue());
+        }
         Drawable d = view.getBackground();
         // Prefer drawable-specific radius over View's often-generic background outline.
         float outlineRadius = drawableRadius(d);

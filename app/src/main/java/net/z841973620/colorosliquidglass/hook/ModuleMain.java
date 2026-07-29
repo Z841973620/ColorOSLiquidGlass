@@ -57,6 +57,7 @@ public final class ModuleMain extends XposedModule {
         hookFolderPopupBlur(cl);
         hookFolderDragPreview(cl);
         hookFolderDragDepthBlur(cl);
+        hookRecentsClearButton(cl);
         hookDragViewMove(cl);
         hookWorkspaceDragOver(cl);
         after("com.android.launcher3.folder.FolderIcon", cl, "onFolderClose", o -> {
@@ -274,11 +275,11 @@ public final class ModuleMain extends XposedModule {
     }
 
     /**
-     * ColorOS applies wallpaper/background blur via OplusDepthController when entering
-     * TOGGLE_BAR / PAGE_PREVIEW (getBlurUnchecked=1): long-press empty desktop for widgets,
-     * long-press icons to select, folder drag, and click-open folder (FolderAnimUtil /
-     * getFolderBlur=1). Suppress that frosted layer while the module is enabled so
-     * LiquidGlass stays the only blur treatment.
+     * ColorOS applies wallpaper/background blur via OplusDepthController for TOGGLE_BAR /
+     * PAGE_PREVIEW / OVERVIEW, and also during the swipe-up-to-Recents hand-follow spring
+     * (SwipeToRecentAnimationHelper → createWallpaperBlurHandFollowAnim) while still in
+     * NORMAL. Zero every wallpaper/icon blur write while the module is enabled so that
+     * gesture transition never shows the frosted layer either.
      */
     private void hookFolderDragDepthBlur(ClassLoader cl) {
         try {
@@ -293,7 +294,8 @@ public final class ModuleMain extends XposedModule {
                 if (m.getParameterCount() < 1 || m.getParameterTypes()[0] != float.class) continue;
                 if (m.isBridge() || m.isSynthetic()) continue;
                 hookOnce(m, chain -> {
-                    if (shouldSuppressDepthBlur(chain.getThisObject())) {
+                    // Always clamp while enabled: gesture blur runs before OVERVIEW is settled.
+                    if (enabled()) {
                         java.util.List<Object> list = chain.getArgs();
                         Object[] args = list.toArray(new Object[0]);
                         if (args.length > 0 && args[0] instanceof Number) {
@@ -318,34 +320,94 @@ public final class ModuleMain extends XposedModule {
             log(5, TAG, "DepthController blur hook unavailable", e);
         }
 
-        // Catch wallpaper blur writes that bypass OplusDepthController.setBlur (e.g. onDraw).
+        // Catch wallpaper blur writes that bypass OplusDepthController.setBlur (e.g. onDraw),
+        // and rewrite hand-follow / state-switch blur animations used by swipe-to-Recents.
         try {
             Class<?> anim = Class.forName(
                     "com.android.quickstep.util.animation.DepthAnimImpl", false, cl);
             for (Method m : anim.getDeclaredMethods()) {
-                if (!m.getName().equals("setWallpaperBlurWithoutAnim") || m.getParameterCount() < 1
-                        || m.getParameterTypes()[0] != float.class
-                        || m.isBridge() || m.isSynthetic()) continue;
-                hookOnce(m, chain -> {
-                    if (shouldSuppressDepthBlur()) {
+                String name = m.getName();
+                if (m.isBridge() || m.isSynthetic()) continue;
+                if (name.equals("setWallpaperBlurWithoutAnim") || name.equals("setMirrorBlurWithoutAnim")
+                        || name.equals("setIconBlurWithoutAnim")) {
+                    if (m.getParameterCount() < 1 || m.getParameterTypes()[0] != float.class) continue;
+                    hookOnce(m, chain -> {
+                        if (enabled()) {
+                            java.util.List<Object> list = chain.getArgs();
+                            Object[] args = list.toArray(new Object[0]);
+                            if (args.length > 0 && args[0] instanceof Number) {
+                                args[0] = 0f;
+                            }
+                            return chain.proceed(args);
+                        }
+                        return chain.proceed();
+                    });
+                } else if (name.equals("stateSwitchForWallpaperBlur")
+                        || name.equals("stateSwitchForMirrorBlur")) {
+                    if (m.getParameterCount() < 2 || m.getParameterTypes()[1] != float.class) continue;
+                    hookOnce(m, chain -> {
+                        if (!enabled()) return chain.proceed();
                         java.util.List<Object> list = chain.getArgs();
                         Object[] args = list.toArray(new Object[0]);
-                        if (args.length > 0 && args[0] instanceof Number) {
-                            args[0] = 0f;
-                        }
+                        args[1] = 0f;
                         return chain.proceed(args);
-                    }
-                    return chain.proceed();
-                });
+                    });
+                } else if (name.equals("createWallpaperBlurHandFollowAnim")
+                        || name.equals("createWallpaperBlurAnim")
+                        || name.equals("createWallpaperBlurSpringAnim")
+                        || name.equals("createIconBlurHandFollowAnim")
+                        || name.equals("createIconBlurAnim")
+                        || name.equals("createIconBlurSpringAnim")
+                        || name.equals("createMirrorBlurAnim")
+                        || name.equals("createMirrorBlurSpringAnim")) {
+                    if (m.getParameterCount() < 1) continue;
+                    hookOnce(m, chain -> {
+                        if (enabled()) zeroAnimInfoEndValue(chain.getArg(0));
+                        return chain.proceed();
+                    });
+                }
             }
         } catch (Throwable e) {
             log(5, TAG, "DepthAnimImpl wallpaper blur hook unavailable", e);
         }
 
-        // Keep state blur target at 0 in desktop edit modes (icon select / add-widget toggle bar).
+        // Swipe-to-Recents hardcodes AnimInfo(..., 1f) and animateToFinalPosition(1f) while still
+        // in NORMAL. Clamp those targets and force blur writes to 0 for the whole gesture.
+        try {
+            Class<?> helper = Class.forName(
+                    "com.android.quickstep.touch.SwipeToRecentAnimationHelper", false, cl);
+            for (Method m : helper.getDeclaredMethods()) {
+                if (m.isBridge() || m.isSynthetic()) continue;
+                String name = m.getName();
+                if (!(name.equals("createBlurAndDragLayerAlphaAnim")
+                        || name.equals("doBackGroundAnim")
+                        || name.equals("initState")
+                        || name.equals("updatePaused"))) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    if (!enabled()) return result;
+                    Object self = chain.getThisObject();
+                    setField(self, "wallpaperBlurEndValue", 0f);
+                    Object blurAnim = field(self, "mWallpaperBlurAnim");
+                    invoke(blurAnim, "animateToFinalPosition",
+                            new Class<?>[] { float.class }, 0f);
+                    Object launcher = field(self, "mLauncher");
+                    if (launcher != null) forceDepthBlur(launcher, 0f);
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "SwipeToRecent blur clamp unavailable", e);
+        }
+
+        // Keep state blur target at 0 in edit modes and Recents (Overview).
         for (String stateClass : new String[] {
                 "com.android.launcher3.states.ToggleBarState",
-                "com.android.launcher3.states.PagePreviewState"
+                "com.android.launcher3.states.PagePreviewState",
+                "com.android.launcher3.uioverrides.states.OverviewState",
+                "com.android.launcher3.uioverrides.states.BackgroundAppState"
         }) {
             try {
                 Class<?> c = Class.forName(stateClass, false, cl);
@@ -390,7 +452,7 @@ public final class ModuleMain extends XposedModule {
         } catch (Throwable e) {
             log(5, TAG, "Folder.animateOpen blur hook unavailable", e);
         }
-        // Long-press empty desktop / icon select enters TOGGLE_BAR with wallpaper blur=1; clear it.
+        // Long-press edit / Recents enter states with wallpaper blur=1; clear it.
         after("com.android.launcher3.statemanager.StateManager", cl, "goToState", o -> {
             if (!enabled()) return;
             Object activity = field(o, "mActivity");
@@ -403,6 +465,117 @@ public final class ModuleMain extends XposedModule {
             if (activity == null) activity = field(o, "mContext");
             if (shouldSuppressDepthBlurForLauncher(activity)) forceDepthBlur(activity, 0f);
         });
+    }
+
+    /**
+     * Recents "清除" is a PressFeedbackButton that self-draws a solid/src fill. Replace that
+     * chrome with LiquidGlass while keeping the label and press-scale feedback.
+     */
+    private void hookRecentsClearButton(ClassLoader cl) {
+        after("com.oplus.quickstep.views.OplusClearAllPanelView", cl, "onFinishInflate", o -> {
+            applyClearButtonGlass(o);
+        });
+        after("com.oplus.quickstep.views.OplusClearAllPanelView", cl, "onAttachedToWindow", o -> {
+            applyClearButtonGlass(o);
+        });
+        try {
+            Class<?> btn = Class.forName("com.android.launcher.views.PressFeedbackButton", false, cl);
+            for (Method m : btn.getDeclaredMethods()) {
+                if (!m.getName().equals("setSrcDrawable") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        View view = (View) chain.getThisObject();
+                        if (enabled() && GlassInstaller.get(view) != null) {
+                            setField(view, "mSrcDrawable", null);
+                            view.invalidate();
+                        }
+                    } catch (Throwable e) {
+                        log(5, TAG, "PressFeedbackButton.setSrcDrawable glass reassert failed", e);
+                    }
+                    return result;
+                });
+            }
+            for (Method m : btn.getDeclaredMethods()) {
+                if (!m.getName().equals("onDraw") || m.getParameterCount() != 1
+                        || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object self = chain.getThisObject();
+                    if (!(self instanceof View) || !enabled() || GlassInstaller.get((View) self) == null) {
+                        return chain.proceed();
+                    }
+                    // OEM fills an opaque-ish rounded rect before text; zero the fill so glass shows.
+                    Object handler = field(self, "mPressFeedbackHandler");
+                    Object savedAlpha = handler != null ? field(handler, "mCurrentColorAlpha") : null;
+                    if (handler != null) setField(handler, "mCurrentColorAlpha", 0);
+                    setField(self, "mSrcDrawable", null);
+                    try {
+                        return chain.proceed();
+                    } finally {
+                        if (handler != null && savedAlpha != null) {
+                            setField(handler, "mCurrentColorAlpha", savedAlpha);
+                        }
+                    }
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "PressFeedbackButton clear-glass hooks unavailable", e);
+        }
+    }
+
+    private void applyClearButtonGlass(Object panel) {
+        if (!enabled() || panel == null) return;
+        Object clearBtn = field(panel, "mClearAllBtn");
+        if (!(clearBtn instanceof View)) return;
+        View button = (View) clearBtn;
+        try {
+            setField(button, "mSrcDrawable", null);
+            Object handler = field(button, "mPressFeedbackHandler");
+            if (handler != null) {
+                invoke(handler, "setDrawableColor", new Class<?>[] { int.class }, 0);
+            }
+            GlassInstaller.installBackground(button, currentConfig());
+            GlassDrawable glass = GlassInstaller.get(button);
+            if (glass != null) {
+                float radius = readClearButtonRadius(button);
+                if (radius > 0f) glass.setCornerRadii(radius, radius, radius, radius);
+            }
+            Runnable refresh = () -> {
+                GlassDrawable live = GlassInstaller.get(button);
+                if (live == null) return;
+                float radius = readClearButtonRadius(button);
+                if (radius <= 0f && button.getHeight() > 0) {
+                    radius = button.getHeight() / 2f;
+                }
+                if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
+                GlassInstaller.forceCapture(button);
+                button.invalidate();
+            };
+            if (button.getWidth() > 0 && button.getHeight() > 0) refresh.run();
+            else button.post(refresh);
+        } catch (Throwable e) {
+            log(5, TAG, "applyClearButtonGlass failed", e);
+        }
+    }
+
+    /** Rewrites AnimInfo endValue so hand-follow / spring blur targets stay at 0. */
+    private static void zeroAnimInfoEndValue(Object animInfo) {
+        if (animInfo == null) return;
+        setField(animInfo, "endValue", 0f);
+    }
+
+    private static float readClearButtonRadius(View button) {
+        Object radius = field(button, "mDrawableRadius");
+        if (radius instanceof Number) {
+            float value = ((Number) radius).floatValue();
+            if (value > 0f) return value;
+        }
+        Object viaGetter = invokeNoArgs(button, "getMDrawableRadius");
+        if (viaGetter instanceof Number) {
+            float value = ((Number) viaGetter).floatValue();
+            if (value > 0f) return value;
+        }
+        return 0f;
     }
 
     private boolean shouldSuppressDepthBlur() {
@@ -419,17 +592,18 @@ public final class ModuleMain extends XposedModule {
     }
 
     private boolean shouldSuppressDepthBlurForLauncher(Object launcher) {
-        return isInDesktopEditBlurState(launcher) || hasOpenFolder(launcher);
+        return isInFrostedWallpaperBlurState(launcher) || hasOpenFolder(launcher);
     }
 
-    /** TOGGLE_BAR (widget tray / icon edit) and PAGE_PREVIEW share the frosted wallpaper blur. */
-    private boolean isInDesktopEditBlurState(Object launcher) {
+    /**
+     * TOGGLE_BAR / PAGE_PREVIEW (icon edit / widget tray) and OVERVIEW* (Recents) share the
+     * frosted wallpaper blur that should stay off while LiquidGlass is enabled.
+     */
+    private boolean isInFrostedWallpaperBlurState(Object launcher) {
         if (launcher == null) return false;
         try {
             ClassLoader cl = launcher.getClass().getClassLoader();
             Class<?> stateClass = Class.forName("com.android.launcher3.LauncherState", false, cl);
-            Object toggleBar = stateClass.getField("TOGGLE_BAR").get(null);
-            Object pagePreview = stateClass.getField("PAGE_PREVIEW").get(null);
             Method isInState = null;
             for (Method m : launcher.getClass().getMethods()) {
                 if ("isInState".equals(m.getName()) && m.getParameterCount() == 1) {
@@ -438,8 +612,22 @@ public final class ModuleMain extends XposedModule {
                 }
             }
             if (isInState == null) return false;
-            return Boolean.TRUE.equals(isInState.invoke(launcher, toggleBar))
-                    || Boolean.TRUE.equals(isInState.invoke(launcher, pagePreview));
+            String[] fields = {
+                    "TOGGLE_BAR", "PAGE_PREVIEW",
+                    "OVERVIEW", "OVERVIEW_MODAL_TASK", "OVERVIEW_SPLIT_SELECT", "BACKGROUND_APP"
+            };
+            for (String name : fields) {
+                Object state;
+                try {
+                    state = stateClass.getField(name).get(null);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if (state != null && Boolean.TRUE.equals(isInState.invoke(launcher, state))) {
+                    return true;
+                }
+            }
+            return false;
         } catch (Throwable ignored) {
             return false;
         }

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -37,6 +38,7 @@ import com.kyant.backdrop.catalog.BackdropDemoScaffold
 import com.kyant.backdrop.catalog.Block
 import com.kyant.backdrop.catalog.components.LiquidButton
 import com.kyant.backdrop.catalog.components.LiquidSlider
+import com.kyant.backdrop.catalog.components.LiquidToggle
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
@@ -62,6 +64,8 @@ fun GlassPlaygroundContent() {
     val rotationAnimation = remember { Animatable(0f) }
 
     var isSheetExpanded by remember { mutableStateOf(true) }
+    var enabled by remember { mutableStateOf(initial.enabled) }
+    var hideDesktopIcons by remember { mutableStateOf(initial.hideDesktopIcons) }
     var glassIntensity by remember { mutableFloatStateOf(initial.glassIntensity) }
     var blurRadiusDp by remember { mutableFloatStateOf(initial.blurRadius) }
     var refractionHeightFrac by remember { mutableFloatStateOf(initial.refractionHeight) }
@@ -71,21 +75,23 @@ fun GlassPlaygroundContent() {
     var highlightIntensity by remember { mutableFloatStateOf(initial.highlightIntensity) }
     var isRestarting by remember { mutableStateOf(false) }
 
-    fun apply(enabled: Boolean) {
+    fun currentConfig() = GlassConfig().also {
+        it.enabled = enabled
+        it.hideDesktopIcons = hideDesktopIcons
+        it.glassIntensity = glassIntensity
+        it.blurRadius = blurRadiusDp
+        it.refractionHeight = refractionHeightFrac
+        it.refractionAmount = refractionAmountFrac
+        it.chromaticAberration = chromaticAberration
+        it.transparency = 0f
+        it.reflectionIntensity = reflectionIntensity
+        it.highlightIntensity = highlightIntensity
+    }
+
+    fun restartLauncher() {
         if (isRestarting) return
         isRestarting = true
-        val config = GlassConfig().also {
-            it.enabled = enabled
-            it.glassIntensity = glassIntensity
-            it.blurRadius = blurRadiusDp
-            it.refractionHeight = refractionHeightFrac
-            it.refractionAmount = refractionAmountFrac
-            it.chromaticAberration = chromaticAberration
-            it.transparency = 0f
-            it.reflectionIntensity = reflectionIntensity
-            it.highlightIntensity = highlightIntensity
-        }
-        RootController.saveAndRestart(context, config) { success, message ->
+        RootController.saveAndRestart(context, currentConfig()) { success, message ->
             isRestarting = false
             Toast.makeText(context, message, if (success) Toast.LENGTH_SHORT else Toast.LENGTH_LONG).show()
         }
@@ -176,6 +182,12 @@ fun GlassPlaygroundContent() {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
+                    PlaygroundToggle("启用修改", { enabled }, sheetBackdrop) { enabled = it }
+                    PlaygroundToggle("隐藏桌面图标", { hideDesktopIcons }, sheetBackdrop) {
+                        hideDesktopIcons = it
+                        LauncherIconController.applyHideDesktopIcons(context, it)
+                        RootController.saveConfig(context, currentConfig()) { _, _ -> }
+                    }
                     PlaygroundSlider("液态玻璃强度", { glassIntensity }, 0f..1f, 0.001f, sheetBackdrop) { glassIntensity = it }
                     PlaygroundSlider("模糊半径", { blurRadiusDp }, 0f..32f, 0.01f, sheetBackdrop) { blurRadiusDp = it }
                     PlaygroundSlider("折射高度", { refractionHeightFrac }, 0f..1f, 0.001f, sheetBackdrop) { refractionHeightFrac = it }
@@ -214,17 +226,37 @@ fun GlassPlaygroundContent() {
             ) { BasicText("重置", style = TextStyle(Color.White, 15.sp)) }
         }
 
-        Row(
-            Modifier.padding(horizontal = 16.dp).statusBarsPadding().align(Alignment.TopCenter),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        LiquidButton(
+            { restartLauncher() },
+            backdrop,
+            Modifier
+                .padding(horizontal = 16.dp)
+                .statusBarsPadding()
+                .align(Alignment.TopCenter),
+            tint = Color(0xFF0088FF)
         ) {
-            LiquidButton({ apply(true) }, backdrop, tint = Color(0xFF0088FF)) {
-                BasicText(if (isRestarting) "正在重启…" else "启用并重启 Launcher", style = TextStyle(Color.White, 14.sp))
-            }
-            LiquidButton({ apply(false) }, backdrop, tint = Color(0xFFE34D59)) {
-                BasicText("关闭修改并重启", style = TextStyle(Color.White, 14.sp))
-            }
+            BasicText(
+                if (isRestarting) "正在重启…" else "重启 Launcher",
+                style = TextStyle(Color.White, 14.sp)
+            )
         }
+    }
+}
+
+@Composable
+private fun PlaygroundToggle(
+    label: String,
+    selected: () -> Boolean,
+    backdrop: com.kyant.backdrop.Backdrop,
+    onSelect: (Boolean) -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        BasicText(label)
+        LiquidToggle(selected = selected, onSelect = onSelect, backdrop = backdrop)
     }
 }
 

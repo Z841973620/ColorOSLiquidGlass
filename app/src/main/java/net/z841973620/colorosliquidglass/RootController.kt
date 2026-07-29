@@ -11,7 +11,7 @@ object RootController {
     private val executor = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
 
-    fun saveAndRestart(context: Context, config: GlassConfig, done: (Boolean, String) -> Unit) {
+    fun saveConfig(context: Context, config: GlassConfig, done: (Boolean, String) -> Unit) {
         val service = App.xposedService
         if (service == null) {
             done(false, "LSPosed 服务未连接：请先在 LSPosed 中启用模块，再重新打开本应用")
@@ -28,9 +28,13 @@ object RootController {
             return
         }
         if (!config.write(context)) {
-            done(false, "本地界面配置写入失败（远程配置已保存，尚未重启）")
+            done(false, "本地界面配置写入失败（远程配置已保存）")
             return
         }
+        done(true, "配置已同步")
+    }
+
+    fun restartLauncher(done: (Boolean, String) -> Unit) {
         executor.execute {
             val result = runRoot(
                 "uid=\$(id -u); echo ROOT_UID=\$uid; " +
@@ -48,7 +52,7 @@ object RootController {
             )
             main.post {
                 if (result.code == 0 && result.output.contains("ROOT_UID=0")) {
-                    done(true, "配置已同步，Launcher 已重新拉起")
+                    done(true, "Launcher 已重新拉起")
                 } else {
                     done(false, "Root 重启失败 (${result.code})\n${result.output.takeLast(500)}")
                 }
@@ -56,8 +60,22 @@ object RootController {
         }
     }
 
+    fun saveAndRestart(context: Context, config: GlassConfig, done: (Boolean, String) -> Unit) {
+        saveConfig(context, config) { success, message ->
+            if (!success) {
+                done(false, message)
+                return@saveConfig
+            }
+            restartLauncher { restartOk, restartMessage ->
+                if (restartOk) done(true, "配置已同步，Launcher 已重新拉起")
+                else done(false, "$message\n$restartMessage")
+            }
+        }
+    }
+
     private fun matches(preferences: android.content.SharedPreferences, config: GlassConfig): Boolean =
         preferences.getBoolean("enabled", !config.enabled) == config.enabled &&
+            preferences.getBoolean("hide_desktop_icons", !config.hideDesktopIcons) == config.hideDesktopIcons &&
             preferences.getFloat("glass_intensity", Float.NaN) == config.glassIntensity &&
             preferences.getFloat("blur_radius", Float.NaN) == config.blurRadius &&
             preferences.getFloat("refraction_height", Float.NaN) == config.refractionHeight &&

@@ -4,6 +4,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+import java.util.Properties
+
 fun signingProp(name: String): String? {
     val fromProject = findProperty(name)?.toString()?.takeIf { it.isNotBlank() }
     if (fromProject != null) return fromProject
@@ -11,9 +13,8 @@ fun signingProp(name: String): String? {
     if (fromEnv != null) return fromEnv
     val propsFile = rootProject.file("keystore.properties")
     if (propsFile.isFile) {
-        val props = java.util.Properties().apply {
-            propsFile.inputStream().use { load(it) }
-        }
+        val props = Properties()
+        propsFile.inputStream().use { stream -> props.load(stream) }
         return props.getProperty(name)?.takeIf { it.isNotBlank() }
     }
     return null
@@ -28,8 +29,8 @@ android {
         applicationId = "net.z841973620.colorosliquidglass"
         minSdk = 33
         targetSdk = 33
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     val storeFilePath = signingProp("RELEASE_STORE_FILE")

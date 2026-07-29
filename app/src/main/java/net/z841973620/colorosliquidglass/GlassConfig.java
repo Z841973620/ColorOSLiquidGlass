@@ -6,6 +6,7 @@ import android.content.SharedPreferences;
 public final class GlassConfig {
     public static final String PREFS = "config";
     public boolean enabled = true;
+    public boolean hideDesktopIcons = false;
     public float glassIntensity = 1f;
     public float blurRadius = 0f;
     public float refractionHeight = .2f;
@@ -18,6 +19,7 @@ public final class GlassConfig {
     public static GlassConfig read(SharedPreferences p) {
         GlassConfig c = new GlassConfig();
         c.enabled = p.getBoolean("enabled", true);
+        c.hideDesktopIcons = p.getBoolean("hide_desktop_icons", false);
         c.glassIntensity = p.getFloat("glass_intensity", 1f);
         c.blurRadius = p.getFloat("blur_radius", 0f);
         c.refractionHeight = p.getFloat("refraction_height", .2f);
@@ -42,6 +44,7 @@ public final class GlassConfig {
         SharedPreferences.Editor editor = preferences.edit();
         if (editor == null) return false;
         return editor.putBoolean("enabled", enabled)
+                .putBoolean("hide_desktop_icons", hideDesktopIcons)
                 .putFloat("glass_intensity", glassIntensity)
                 .putFloat("blur_radius", blurRadius)
                 .putFloat("refraction_height", refractionHeight)

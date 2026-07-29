@@ -1,0 +1,82 @@
+package net.z841973620.colorosliquidglass
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.util.concurrent.Executors
+
+object RootController {
+    private val executor = Executors.newSingleThreadExecutor()
+    private val main = Handler(Looper.getMainLooper())
+
+    fun saveAndRestart(context: Context, config: GlassConfig, done: (Boolean, String) -> Unit) {
+        val service = App.xposedService
+        if (service == null) {
+            done(false, "LSPosed 服务未连接：请先在 LSPosed 中启用模块，再重新打开本应用")
+            return
+        }
+        val remote = try {
+            service.getRemotePreferences(GlassConfig.PREFS)
+        } catch (t: Throwable) {
+            done(false, "无法获取 LSPosed 远程配置：${t.message}")
+            return
+        }
+        if (!config.write(remote) || !matches(remote, config)) {
+            done(false, "LSPosed 远程配置写入或回读校验失败")
+            return
+        }
+        if (!config.write(context)) {
+            done(false, "本地界面配置写入失败（远程配置已保存，尚未重启）")
+            return
+        }
+        executor.execute {
+            val result = runRoot(
+                "uid=\$(id -u); echo ROOT_UID=\$uid; " +
+                    "if [ \"\$uid\" != \"0\" ]; then exit 126; fi; " +
+                    "old_home=\$(pidof com.android.launcher); " +
+                    "echo OLD_HOME=\$old_home; " +
+                    "[ -z \"\$old_home\" ] || kill -9 \$old_home; " +
+                    "am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1; " +
+                    "i=0; while [ \$i -lt 40 ]; do " +
+                    "new_home=\$(pidof com.android.launcher); " +
+                    "if [ -n \"\$new_home\" ] && [ \"\$new_home\" != \"\$old_home\" ]; then " +
+                    "echo NEW_HOME=\$new_home; exit 0; fi; " +
+                    "sleep 0.25; i=\$((i+1)); done; " +
+                    "echo RESTART_TIMEOUT HOME=\$new_home; exit 127"
+            )
+            main.post {
+                if (result.code == 0 && result.output.contains("ROOT_UID=0")) {
+                    done(true, "配置已同步，Launcher 已重新拉起")
+                } else {
+                    done(false, "Root 重启失败 (${result.code})\n${result.output.takeLast(500)}")
+                }
+            }
+        }
+    }
+
+    private fun matches(preferences: android.content.SharedPreferences, config: GlassConfig): Boolean =
+        preferences.getBoolean("enabled", !config.enabled) == config.enabled &&
+            preferences.getFloat("glass_intensity", Float.NaN) == config.glassIntensity &&
+            preferences.getFloat("blur_radius", Float.NaN) == config.blurRadius &&
+            preferences.getFloat("refraction_height", Float.NaN) == config.refractionHeight &&
+            preferences.getFloat("refraction_amount", Float.NaN) == config.refractionAmount &&
+            preferences.getFloat("chromatic_aberration", Float.NaN) == config.chromaticAberration &&
+            preferences.getFloat("transparency", Float.NaN) == 0f &&
+            preferences.getFloat("reflection_intensity", Float.NaN) == config.reflectionIntensity &&
+            preferences.getFloat("highlight_intensity", Float.NaN) == config.highlightIntensity &&
+            preferences.getLong("updated_at", 0L) > 0L
+
+    private data class CommandResult(val code: Int, val output: String)
+
+    private fun runRoot(command: String): CommandResult {
+        return try {
+            val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
+            val output = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }
+            CommandResult(process.waitFor(), output)
+        } catch (t: Throwable) {
+            CommandResult(-1, t.stackTraceToString())
+        }
+    }
+}

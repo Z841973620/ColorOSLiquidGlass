@@ -1,27 +1,9 @@
-# Liquid Glass (Backdrop)
+# ColorOS LiquidGlass
 
-![frontPhoto](artworks/banner.jpg)
+为 ColorOS 添加液态玻璃效果
 
-A customizable Liquid Glass effect library for Compose Multiplatform.
+使用 LSPosed API 101
 
-## Docs
+目前适用于 ColorOS 16，已完成文件夹部分的样式修改
 
-[![Maven Central](https://img.shields.io/maven-central/v/io.github.kyant0/backdrop)](https://central.sonatype.com/artifact/io.github.kyant0/backdrop)
-
-[Documentation](https://kyant.gitbook.io/backdrop)
-
-## Components
-
-The library does not include any high-level components; you will need to create your own.
-Below are some example components:
-
-- [LiquidButton](/app/src/commonMain/kotlin/com/kyant/backdrop/catalog/components/LiquidButton.kt)
-- [LiquidToggle](/app/src/commonMain/kotlin/com/kyant/backdrop/catalog/components/LiquidToggle.kt)
-- [LiquidSlider](/app/src/commonMain/kotlin/com/kyant/backdrop/catalog/components/LiquidSlider.kt)
-- [LiquidBottomTabs](/app/src/commonMain/kotlin/com/kyant/backdrop/catalog/components/LiquidBottomTabs.kt)
-
-## Demo
-
-- [Backdrop Catalog](./androidApp/release/androidApp-release.apk)
-
-![Screenshots of Backdrop Catalog](artworks/catalog_app.jpg)
+<img width="304" height="660" alt="Screenshot_01" src="imgs/Screenshot_01.jpg" />

@@ -12,8 +12,10 @@ import net.z841973620.colorosliquidglass.GlassConfig;
 
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 
@@ -75,6 +77,39 @@ public final class GlassInstaller {
     public static void forceCapture(View view) {
         if (view == null) return;
         BackdropCapture.forceCapture(view);
+    }
+
+    /**
+     * Soft-refreshes every installed glass host after unlock / resume. Keeps the last good
+     * snapshot until a meaningful replacement is captured.
+     */
+    public static void refreshAll() {
+        BackdropCapture.refreshAll();
+        List<View> hosts;
+        synchronized (INSTALLED) {
+            hosts = new ArrayList<>(INSTALLED.keySet());
+        }
+        for (View view : hosts) {
+            if (view != null) view.invalidate();
+        }
+    }
+
+    /** Removes a previously installed glass background and clears installer bookkeeping. */
+    public static void uninstall(View view) {
+        if (view == null) return;
+        Runnable remove = () -> {
+            WeakReference<GlassDrawable> reference = INSTALLED.remove(view);
+            GlassDrawable glass = reference == null ? null : reference.get();
+            BackdropCapture.unregister(view);
+            if (glass != null && view.getBackground() == glass) {
+                view.setBackground(null);
+            } else if (view.getBackground() instanceof GlassDrawable) {
+                view.setBackground(null);
+            }
+            view.invalidate();
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) remove.run();
+        else if (!view.post(remove)) Log.e(TAG, "Uninstall post rejected for " + view.getClass().getName());
     }
 
     /** Restores an OEM image when the object leaves the state targeted by the module. */

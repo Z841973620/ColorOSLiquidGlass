@@ -12,6 +12,8 @@ import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 
@@ -90,6 +92,33 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         capture.lastCapture = SystemClock.uptimeMillis();
     }
 
+    /**
+     * Marks every live capture dirty and keeps active pacing briefly. Used after unlock /
+     * resume when wallpaper and DragLayer alpha settle asynchronously.
+     * Keeps the last good frame until a meaningful replacement arrives (no fallback flash).
+     */
+    static void refreshAll() {
+        long now = SystemClock.uptimeMillis();
+        List<View> targets = new ArrayList<>();
+        synchronized (CAPTURES) {
+            for (Map.Entry<View, BackdropCapture> entry : CAPTURES.entrySet()) {
+                View target = entry.getKey();
+                BackdropCapture capture = entry.getValue();
+                if (capture == null) continue;
+                capture.dirty = true;
+                capture.activeUntil = Math.max(capture.activeUntil, now + 2000L);
+                // Force geometry re-evaluation so depth/alpha changes are not missed.
+                capture.lastWallpaperDepth = Float.NaN;
+                capture.lastRootScale = Float.NaN;
+                capture.lastHierarchyScale = Float.NaN;
+                capture.lastHierarchyAlpha = Float.NaN;
+                capture.lastRootAlpha = Float.NaN;
+                if (target != null) targets.add(target);
+            }
+        }
+        for (View target : targets) target.invalidate();
+    }
+
     private final WeakReference<View> targetRef;
     private WeakReference<View> rootRef;
     private Bitmap frontBitmap;
@@ -114,6 +143,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
     private float lastHierarchyScale = Float.NaN;
     private float lastRootScale = Float.NaN;
     private float lastWallpaperDepth = Float.NaN;
+    private float lastHierarchyAlpha = Float.NaN;
+    private float lastRootAlpha = Float.NaN;
     private float bitmapScaleX = 1f;
     private float bitmapScaleY = 1f;
 
@@ -157,6 +188,13 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             activeUntil = SystemClock.uptimeMillis() + IDLE_SETTLE_MS;
         }
 
+        // Lock / early unlock: DragLayer alpha is 0. Skip sampling so we do not overwrite a
+        // good snapshot with an empty frame; stay dirty until the hierarchy is visible again.
+        if (cumulativeAlpha(owner) < 0.08f || root.getAlpha() < 0.08f) {
+            dirty = true;
+            return true;
+        }
+
         // Skip the invalidate echo from publishing a frame, but never drop a real geometry /
         // background-scale change (Recents wallpaper zoom keeps folder layout coords fixed).
         if (skipCaptureFromSelfInvalidate) {
@@ -188,6 +226,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         float hierarchyScale = cumulativeScale(owner);
         float rootScale = Math.abs(root.getScaleX() * root.getScaleY());
         float wallpaperDepth = readWallpaperDepth(root);
+        float hierarchyAlpha = cumulativeAlpha(owner);
+        float rootAlpha = root.getAlpha();
         int visibleW = 0;
         int visibleH = 0;
         if (owner.getGlobalVisibleRect(visibleScratch)) {
@@ -200,7 +240,9 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 || visibleW != lastVisibleW || visibleH != lastVisibleH
                 || scaleChanged(hierarchyScale, lastHierarchyScale)
                 || scaleChanged(rootScale, lastRootScale)
-                || scaleChanged(wallpaperDepth, lastWallpaperDepth);
+                || scaleChanged(wallpaperDepth, lastWallpaperDepth)
+                || scaleChanged(hierarchyAlpha, lastHierarchyAlpha)
+                || scaleChanged(rootAlpha, lastRootAlpha);
         lastTargetW = w;
         lastTargetH = h;
         lastWindowX = locationScratch[0];
@@ -210,6 +252,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         lastHierarchyScale = hierarchyScale;
         lastRootScale = rootScale;
         lastWallpaperDepth = wallpaperDepth;
+        lastHierarchyAlpha = hierarchyAlpha;
+        lastRootAlpha = rootAlpha;
         return changed;
     }
 
@@ -229,6 +273,18 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             current = (View) parent;
         }
         return scale;
+    }
+
+    /** Product of alphas up the parent chain (DragLayer goes to 0 while the keyguard is up). */
+    private static float cumulativeAlpha(View view) {
+        float alpha = 1f;
+        for (View current = view; current != null; ) {
+            alpha *= current.getAlpha();
+            ViewParent parent = current.getParent();
+            if (!(parent instanceof View)) break;
+            current = (View) parent;
+        }
+        return alpha;
     }
 
     /**
@@ -297,8 +353,11 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             root.draw(canvas);
             drawOverlaySource(target, canvas);
             canvas.restore();
-            // Validate only until the first good frame; later / forced frames skip the pixel scan.
-            complete = forced || validFrame || isMeaningful(backBitmap);
+            // Never publish empty/near-black frames over a good snapshot. ColorOS sets DragLayer
+            // alpha to 0 while locked; later frames used to skip the pixel scan once validFrame
+            // was true and could replace a useful backdrop with garbage until the next idle tick.
+            // Forced captures may only bootstrap the first frame.
+            complete = isMeaningful(backBitmap) || (forced && !validFrame);
         } catch (Throwable ignored) {
             // Keep the previous useful frame.
         } finally {

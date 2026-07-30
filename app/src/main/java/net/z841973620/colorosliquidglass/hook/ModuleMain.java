@@ -1,8 +1,10 @@
 package net.z841973620.colorosliquidglass.hook;
 
+import android.animation.ObjectAnimator;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.drawable.Drawable;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
@@ -14,6 +16,7 @@ import io.github.libxposed.api.XposedModuleInterface;
 import net.z841973620.colorosliquidglass.GlassConfig;
 import net.z841973620.colorosliquidglass.glass.GlassDrawable;
 import net.z841973620.colorosliquidglass.glass.GlassInstaller;
+import net.z841973620.colorosliquidglass.glass.WallpaperScaleTracker;
 
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
@@ -77,6 +80,7 @@ public final class ModuleMain extends XposedModule {
         hookDragViewMove(cl);
         hookWorkspaceDragOver(cl);
         hookUnlockGlassRefresh(cl);
+        hookWallpaperScaleTracking(cl);
         after("com.android.launcher3.folder.FolderIcon", cl, "onFolderClose", o -> {
             endFolderOpen(o);
             syncFolderIconDeferred(o, true);
@@ -227,27 +231,68 @@ public final class ModuleMain extends XposedModule {
         try {
             Class<?> c = Class.forName(className, false, cl);
             for (Method m : c.getDeclaredMethods()) {
-                if ((m.getName().equals("reorderAndShow")
-                        || m.getName().equals("onCreateOpenAnimation")
-                        || m.getName().equals("animateOpen")) && m.getParameterCount() <= 1
-                        && !m.isBridge() && !m.isSynthetic()) {
+                String name = m.getName();
+                if (m.isBridge() || m.isSynthetic()) continue;
+                // Cover open / reorder paths used by folders, app icons, and widgets alike.
+                if ((name.equals("reorderAndShow")
+                        || name.equals("onCreateOpenAnimation")
+                        || name.equals("animateOpen")
+                        || name.equals("populateAndShow")
+                        || name.equals("showEditPopupContainer"))
+                        && m.getParameterCount() <= 6) {
                     hookOnce(m, chain -> {
-                        keepFolderPopupBlurTransparent(chain.getThisObject());
+                        keepPopupBlurTransparent(chain.getThisObject());
                         Object result = chain.proceed();
-                        keepFolderPopupBlurTransparent(chain.getThisObject());
+                        keepPopupBlurTransparent(chain.getThisObject());
                         return result;
                     });
                 }
             }
+            // Static showForIcon is the shared entry for BubbleTextView / widget / folder menus.
+            for (Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals("showForIcon") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (result != null) keepPopupBlurTransparent(result);
+                    } catch (Throwable e) {
+                        log(5, TAG, "showForIcon popup blur suppress failed", e);
+                    }
+                    return result;
+                });
+            }
         } catch (Throwable e) {
-            log(5, TAG, "Folder popup blur hook unavailable", e);
+            log(5, TAG, "Popup blur hook unavailable", e);
+        }
+        // Belt-and-suspenders: open anim would fade PopupBlurView to 1 even if we zeroed alpha.
+        try {
+            Class<?> blur = Class.forName("com.android.launcher3.popup.PopupBlurView", false, cl);
+            for (Method m : blur.getDeclaredMethods()) {
+                if (!m.getName().equals("createBlurAnim") || m.getParameterCount() != 1
+                        || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    if (enabled() && Boolean.TRUE.equals(chain.getArg(0))) {
+                        Object self = chain.getThisObject();
+                        if (self instanceof View) ((View) self).setAlpha(0f);
+                        Object anim = chain.proceed();
+                        if (anim instanceof ObjectAnimator) {
+                            ObjectAnimator oa = (ObjectAnimator) anim;
+                            oa.setFloatValues(0f, 0f);
+                            oa.setDuration(0L);
+                        }
+                        return anim;
+                    }
+                    return chain.proceed();
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "PopupBlurView.createBlurAnim hook unavailable", e);
         }
     }
 
-    private void keepFolderPopupBlurTransparent(Object popup) {
-        if (!enabled()) return;
-        Object longPressed = field(popup, "mLongPressedView");
-        if (!isClassOrSubclass(longPressed, "com.android.launcher3.folder.FolderIcon")) return;
+    /** Hides the fullscreen PopupBlurView for any long-press options menu (icon / widget / folder). */
+    private void keepPopupBlurTransparent(Object popup) {
+        if (!enabled() || popup == null) return;
         // Keep the PopupBlurView object alive so popup close/drag-resize bookkeeping still runs.
         // Only skip the open alpha animation that makes the full-screen blur visible.
         setField(popup, "mAddPopupBlurView", false);
@@ -1555,6 +1600,39 @@ public final class ModuleMain extends XposedModule {
                 if (token != unlockGlassRefreshToken || !enabled()) return;
                 GlassInstaller.refreshAll();
             }, delay);
+        }
+    }
+
+    /**
+     * Recents / app transitions zoom the system wallpaper via sendWallpaperCommand (1.0↔1.2).
+     * That surface is not in the View hierarchy; track the Bundle so BackdropCapture can mirror it.
+     */
+    private void hookWallpaperScaleTracking(ClassLoader cl) {
+        try {
+            Class<?> depth = Class.forName(
+                    "com.android.launcher3.uioverrides.states.OplusDepthController", false, cl);
+            for (Method m : depth.getDeclaredMethods()) {
+                if (!m.getName().equals("startWallpaperAnimation") || m.isBridge() || m.isSynthetic()) {
+                    continue;
+                }
+                Class<?>[] types = m.getParameterTypes();
+                if (types.length != 3 || types[2] != Bundle.class) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        Object extras = chain.getArg(2);
+                        if (extras instanceof Bundle) {
+                            WallpaperScaleTracker.onWallpaperCommand((Bundle) extras);
+                            if (enabled()) GlassInstaller.refreshAll();
+                        }
+                    } catch (Throwable e) {
+                        log(5, TAG, "Wallpaper scale track failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "Wallpaper scale tracking hook unavailable", e);
         }
     }
 

@@ -113,6 +113,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 capture.lastHierarchyScale = Float.NaN;
                 capture.lastHierarchyAlpha = Float.NaN;
                 capture.lastRootAlpha = Float.NaN;
+                capture.lastWallpaperScale = Float.NaN;
                 if (target != null) targets.add(target);
             }
         }
@@ -145,6 +146,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
     private float lastWallpaperDepth = Float.NaN;
     private float lastHierarchyAlpha = Float.NaN;
     private float lastRootAlpha = Float.NaN;
+    private float lastWallpaperScale = Float.NaN;
     private float bitmapScaleX = 1f;
     private float bitmapScaleY = 1f;
 
@@ -203,7 +205,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         }
 
         long now = SystemClock.uptimeMillis();
-        boolean active = now <= activeUntil || geometryChanged;
+        boolean wallpaperAnimating = WallpaperScaleTracker.isAnimating();
+        boolean active = now <= activeUntil || geometryChanged || wallpaperAnimating;
         long interval = active ? ACTIVE_CAPTURE_INTERVAL_MS : IDLE_CAPTURE_INTERVAL_MS;
         // Spread idle refreshes so many large folders do not all redraw the hierarchy together.
         if (!active) interval += Math.floorMod(System.identityHashCode(this), 45);
@@ -228,6 +231,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         float wallpaperDepth = readWallpaperDepth(root);
         float hierarchyAlpha = cumulativeAlpha(owner);
         float rootAlpha = root.getAlpha();
+        float wallpaperScale = WallpaperScaleTracker.current();
         int visibleW = 0;
         int visibleH = 0;
         if (owner.getGlobalVisibleRect(visibleScratch)) {
@@ -242,7 +246,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 || scaleChanged(rootScale, lastRootScale)
                 || scaleChanged(wallpaperDepth, lastWallpaperDepth)
                 || scaleChanged(hierarchyAlpha, lastHierarchyAlpha)
-                || scaleChanged(rootAlpha, lastRootAlpha);
+                || scaleChanged(rootAlpha, lastRootAlpha)
+                || scaleChanged(wallpaperScale, lastWallpaperScale);
         lastTargetW = w;
         lastTargetH = h;
         lastWindowX = locationScratch[0];
@@ -254,6 +259,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         lastWallpaperDepth = wallpaperDepth;
         lastHierarchyAlpha = hierarchyAlpha;
         lastRootAlpha = rootAlpha;
+        lastWallpaperScale = wallpaperScale;
         return changed;
     }
 
@@ -479,13 +485,20 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             int sourceHeight = Math.max(1, wallpaper.getIntrinsicHeight());
             int width = root.getWidth();
             int height = root.getHeight();
-            float scale = Math.max(width / (float) sourceWidth, height / (float) sourceHeight);
-            int drawWidth = Math.round(sourceWidth * scale);
-            int drawHeight = Math.round(sourceHeight * scale);
+            float cover = Math.max(width / (float) sourceWidth, height / (float) sourceHeight);
+            int drawWidth = Math.round(sourceWidth * cover);
+            int drawHeight = Math.round(sourceHeight * cover);
             int left = (width - drawWidth) / 2;
             int top = (height - drawHeight) / 2;
             wallpaper.setBounds(left, top, left + drawWidth, top + drawHeight);
+            // System wallpaper zoom lives on another surface; mirror its center-scale here.
+            float zoom = WallpaperScaleTracker.current();
+            int save = canvas.save();
+            if (Math.abs(zoom - 1f) > 0.0005f) {
+                canvas.scale(zoom, zoom, width * 0.5f, height * 0.5f);
+            }
             wallpaper.draw(canvas);
+            canvas.restoreToCount(save);
             wallpaper.setBounds(old);
         } catch (Throwable ignored) { }
     }

@@ -45,7 +45,6 @@ public final class ModuleMain extends XposedModule {
     /** Bumps when a new unlock/resume refresh burst starts so older delayed posts are ignored. */
     private volatile int unlockGlassRefreshToken;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-
     @Override public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         String pkg = param.getPackageName();
         if (!pkg.equals("com.android.launcher")) return;
@@ -123,13 +122,37 @@ public final class ModuleMain extends XposedModule {
                 }
             });
 
+            // Drag-over accept hides mBgView and paints OEM blur via CellLayout delegate.
+            // Keep the glass-bearing mBgView visible; drawBackground(Canvas,View) already
+            // no-ops OEM fill when LiquidGlass is installed.
+            for (Method m : c.getDeclaredMethods()) {
+                if (m.isBridge() || m.isSynthetic()) continue;
+                String name = m.getName();
+                if (!(name.equals("animateToAccept")
+                        || name.equals("animateToRest")
+                        || name.equals("clearDrawingDelegate")
+                        || name.equals("delegateDrawing")
+                        || name.equals("lambda$animateToAccept$0"))) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        keepHoverFolderGlassVisible(chain.getThisObject());
+                    } catch (Throwable e) {
+                        log(5, TAG, className + "." + name + " hover glass failed", e);
+                    }
+                    return result;
+                });
+            }
+
             // ColorOS also paints mBgDrawable directly from PreviewBackground.drawBackground;
             // suppress that object-level blur/background after the dedicated mBgView owns glass.
             try {
                 Method drawBackground = c.getDeclaredMethod("drawBackground", Canvas.class, View.class);
                 hookOnce(drawBackground, chain -> {
-                    Object bgView = field(chain.getThisObject(), "mBgView");
-                    if (enabled() && bgView instanceof View && GlassInstaller.get((View) bgView) != null) {
+                    if (!enabled()) return chain.proceed();
+                    Object preview = chain.getThisObject();
+                    Object bgView = field(preview, "mBgView");
+                    if (bgView instanceof View && GlassInstaller.get((View) bgView) != null) {
                         return null;
                     }
                     return chain.proceed();
@@ -320,8 +343,15 @@ public final class ModuleMain extends XposedModule {
                             if (content instanceof View) {
                                 suppressLayerBlur((View) content);
                                 GlassInstaller.installBackground((View) content, currentConfig());
+                                // Keep glass opaque. Desktop icons under the folder are drawn
+                                // live on the HW canvas in GlassDrawable (DesktopIconOverlay),
+                                // not via translucent glass or software sample paste.
                                 GlassDrawable glass = GlassInstaller.get((View) content);
-                                if (glass != null) glass.setAlpha(184);
+                                if (glass != null) glass.setAlpha(255);
+                                View page = desktopPageUnderDrag(chain.getThisObject());
+                                if (page != null) {
+                                    GlassInstaller.setOverlaySource((View) content, page);
+                                }
                             }
                         } catch (Throwable e) {
                             log(5, TAG, className + ".handleFolderBackground apply failed", e);
@@ -1367,14 +1397,25 @@ public final class ModuleMain extends XposedModule {
         return null;
     }
 
+    private volatile Object folderDragSource;
+
     private void beginFolderDrag(Object folderIcon) {
         folderDragActive = true;
+        folderDragSource = folderIcon;
         forceDepthBlur(folderIcon, 0f);
     }
 
     private void endFolderDrag(Object host) {
         if (!folderDragActive) return;
         folderDragActive = false;
+        Object source = folderDragSource;
+        folderDragSource = null;
+        // Finger-up: drop overlay seeds immediately. Otherwise the returned FolderIcon keeps
+        // compositing the desktop into its own LiquidGlass (self secondary-refraction).
+        try {
+            GlassInstaller.clearDragOverlays();
+            if (source != null) syncFolderIconDeferred(source, true);
+        } catch (Throwable ignored) { }
         // Stay suppressed while still in TOGGLE_BAR / open folder; otherwise restore.
         Object launcher = resolveLauncher(host);
         if (shouldSuppressDepthBlurForLauncher(launcher) || folderOpenActive) {
@@ -1502,9 +1543,22 @@ public final class ModuleMain extends XposedModule {
                 if (!m.getName().equals("move") || m.isBridge() || m.isSynthetic()) continue;
                 hookOnce(m, chain -> {
                     Object result = chain.proceed();
-                    Object content = invokeNoArgs(chain.getThisObject(), "getContentView");
-                    if (content instanceof View && GlassInstaller.get((View) content) != null) {
-                        ((View) content).invalidate();
+                    try {
+                        Object content = invokeNoArgs(chain.getThisObject(), "getContentView");
+                        if (!(content instanceof View)) return result;
+                        View view = (View) content;
+                        if (folderDragActive) {
+                            // Finger motion dirties geometry; only reinstall if OEM cleared glass.
+                            if (GlassInstaller.get(view) == null) {
+                                refreshFolderDragGlass(chain.getThisObject(), true);
+                            } else {
+                                view.invalidate();
+                            }
+                        } else if (GlassInstaller.get(view) != null) {
+                            view.invalidate();
+                        }
+                    } catch (Throwable e) {
+                        log(5, TAG, "DragView.move glass refresh failed", e);
                     }
                     return result;
                 });
@@ -1517,18 +1571,156 @@ public final class ModuleMain extends XposedModule {
     private void hookWorkspaceDragOver(ClassLoader cl) {
         after("com.android.launcher3.OplusWorkspace", cl, "onDragOver", this::syncDragOverlaySource);
         after("com.android.launcher3.Workspace", cl, "onDragOver", this::syncDragOverlaySource);
+        // Page-edge auto-scroll moves Workspace under a stationary DragView; reassert glass and
+        // force a fresh backdrop sample for the whole scroll window.
+        for (String className : new String[] {
+                "com.android.launcher3.OplusWorkspace",
+                "com.android.launcher3.Workspace"
+        }) {
+            try {
+                Class<?> c = Class.forName(className, false, cl);
+                for (Method m : c.getDeclaredMethods()) {
+                    if (m.isBridge() || m.isSynthetic()) continue;
+                    String name = m.getName();
+                    if (!(name.equals("onScrollChanged")
+                            || name.equals("onPageBeginMoving")
+                            || name.equals("onPageEndTransition")
+                            || name.equals("snapToPageForDrag"))) continue;
+                    hookOnce(m, chain -> {
+                        Object result = chain.proceed();
+                        try {
+                            if (folderDragActive) refreshFolderDragGlass(null, true);
+                        } catch (Throwable e) {
+                            log(5, TAG, className + "." + name + " drag glass refresh failed", e);
+                        }
+                        return result;
+                    });
+                }
+            } catch (Throwable e) {
+                log(5, TAG, className + " page-scroll glass hook unavailable", e);
+            }
+        }
     }
 
     private void syncDragOverlaySource(Object workspace) {
-        Object hover = field(workspace, "mDragOverView");
-        Object launcher = field(workspace, "mLauncher");
-        Object dragController = invokeNoArgs(launcher, "getDragController");
-        Object dragObject = field(dragController, "mDragObject");
-        Object dragView = field(dragObject, "dragView");
-        Object content = invokeNoArgs(dragView, "getContentView");
-        if (content instanceof View && GlassInstaller.get((View) content) != null) {
-            GlassInstaller.setOverlaySource((View) content, hover instanceof View ? (View) hover : null);
+        // Bind the desktop CellLayout so GlassDrawable can HW-draw icons under the dragged
+        // folder glass. Software backdrop capture cannot see ColorOS multi-node icon RenderNodes
+        // (setAlpha(0) proved the live desktop layer is correct).
+        View content = findFolderDragContentView(null);
+        View desktopPage = desktopPageUnderDrag(workspace);
+        Object hover = dragHoverView(workspace);
+        boolean hoverIsFolder = hover != null
+                && isClassOrSubclass(hover, "com.android.launcher3.folder.FolderIcon");
+
+        if (content != null && GlassInstaller.get(content) != null) {
+            GlassDrawable glass = GlassInstaller.get(content);
+            if (glass != null) glass.setAlpha(255);
+            GlassInstaller.setOverlaySource(content, desktopPage);
+            if (folderDragActive) {
+                GlassInstaller.forceCapture(content);
+                content.invalidate();
+            }
         }
+
+        if (hoverIsFolder) {
+            syncFolderIconDeferred(hover, true);
+            keepHoverFolderGlassVisible(field(hover, "mBackground"));
+        }
+    }
+
+    /**
+     * CellLayout currently under the dragged folder — same page OEM uses for
+     * {@code getShortcutsAndWidgets()} during TOGGLE_BAR.
+     */
+    private View desktopPageUnderDrag(Object workspace) {
+        Object layout = field(workspace, "mDragTargetLayout");
+        if (layout instanceof View) return (View) layout;
+        try {
+            Object pageIndex = invokeNoArgs(workspace, "getCurrentPage");
+            if (pageIndex instanceof Number) {
+                Object page = invoke(workspace, "getPageAt",
+                        new Class<?>[] { int.class },
+                        ((Number) pageIndex).intValue());
+                if (page instanceof View) return (View) page;
+            }
+        } catch (Throwable ignored) { }
+        return workspace instanceof View ? (View) workspace : null;
+    }
+
+    /** Prefer mDragOverView; fall back to mDragTargetLayout + mTargetCell. */
+    private Object dragHoverView(Object workspace) {
+        Object hover = field(workspace, "mDragOverView");
+        if (hover instanceof View) return hover;
+        Object layout = field(workspace, "mDragTargetLayout");
+        Object cell = field(workspace, "mTargetCell");
+        if (!(layout instanceof View) || !(cell instanceof int[])) return null;
+        int[] targetCell = (int[]) cell;
+        if (targetCell.length < 2) return null;
+        try {
+            Object child = invoke(layout, "getChildAt",
+                    new Class<?>[] { int.class, int.class },
+                    targetCell[0], targetCell[1]);
+            return child instanceof View ? child : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * While another item is dragged onto a folder, ColorOS hides {@code mBgView} and delegates
+     * OEM blur drawing to CellLayout. Restore the glass host and reassert LiquidGlass.
+     */
+    private void keepHoverFolderGlassVisible(Object previewBackground) {
+        if (!enabled() || previewBackground == null) return;
+        Object host = field(previewBackground, "mInvalidateDelegate");
+        if (!isClassOrSubclass(host, "com.android.launcher3.folder.FolderIcon")) return;
+        if (isFolderOpen(host)) return;
+        Object bgView = field(previewBackground, "mBgView");
+        if (bgView instanceof View) {
+            ((View) bgView).setVisibility(View.VISIBLE);
+        }
+        setFolderBackgroundVisibility(previewBackground, true);
+        syncFolderPreview(host, previewBackground);
+        if (bgView instanceof View) {
+            View view = (View) bgView;
+            if (GlassInstaller.get(view) != null) {
+                GlassInstaller.forceCapture(view);
+                view.invalidate();
+            }
+        }
+        if (host instanceof View) ((View) host).invalidate();
+    }
+
+    /**
+     * Keeps the dragged-folder LiquidGlass backdrop in sync while the desktop pages scroll
+     * under a mostly stationary DragView, and reinstalls glass if OEM restored LayerBlur.
+     */
+    private void refreshFolderDragGlass(Object dragViewHint, boolean reassert) {
+        if (!enabled() || !folderDragActive) return;
+        View content = findFolderDragContentView(dragViewHint);
+        if (content == null) return;
+        if (reassert || GlassInstaller.get(content) == null) {
+            suppressLayerBlur(content);
+            GlassInstaller.installBackground(content, currentConfig());
+            GlassDrawable glass = GlassInstaller.get(content);
+            if (glass != null) glass.setAlpha(255);
+        }
+        if (GlassInstaller.get(content) != null) {
+            GlassInstaller.forceCapture(content);
+            content.invalidate();
+        }
+    }
+
+    private View findFolderDragContentView(Object dragViewHint) {
+        Object dragView = dragViewHint;
+        if (dragView == null) {
+            Object launcher = findActiveLauncher();
+            Object dragController = invokeNoArgs(launcher, "getDragController");
+            Object dragObject = field(dragController, "mDragObject");
+            dragView = field(dragObject, "dragView");
+        }
+        Object content = invokeNoArgs(dragView, "getContentView");
+        return content instanceof View ? (View) content : null;
     }
 
     private void hookFolderRefreshEvents(ClassLoader cl) {

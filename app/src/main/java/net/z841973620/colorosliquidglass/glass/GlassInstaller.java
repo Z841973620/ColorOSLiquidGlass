@@ -73,6 +73,11 @@ public final class GlassInstaller {
         BackdropCapture.setOverlaySource(target, overlay);
     }
 
+    /** Clear all drag overlay seeds and folder raster caches after finger-up. */
+    public static void clearDragOverlays() {
+        BackdropCapture.clearAllOverlaySources();
+    }
+
     /** Forces a fresh backdrop sample for a view whose size/position just changed. */
     public static void forceCapture(View view) {
         if (view == null) return;

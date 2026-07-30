@@ -69,6 +69,23 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         if (target != null) target.invalidate();
     }
 
+    /** Drop every drag-glass overlay seed (finger-up must not leave seeds on FolderIcons). */
+    static void clearAllOverlaySources() {
+        synchronized (CAPTURES) {
+            OVERLAY_SOURCES.clear();
+        }
+        DesktopIconOverlay.clearFolderSnaps();
+    }
+
+    /** Desktop CellLayout (or page) bound for {@link DesktopIconOverlay}. */
+    static View overlaySourceOf(View target) {
+        if (target == null) return null;
+        synchronized (CAPTURES) {
+            WeakReference<View> reference = OVERLAY_SOURCES.get(target);
+            return reference == null ? null : reference.get();
+        }
+    }
+
     /** Forces an immediate target-local capture, used while resize-frame geometry is animating. */
     static void forceCapture(View target) {
         if (target == null || target.getWidth() <= 0 || target.getHeight() <= 0) return;
@@ -114,6 +131,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 capture.lastHierarchyAlpha = Float.NaN;
                 capture.lastRootAlpha = Float.NaN;
                 capture.lastWallpaperScale = Float.NaN;
+                capture.lastWorkspaceScrollX = Integer.MIN_VALUE;
+                capture.lastWorkspaceScrollY = Integer.MIN_VALUE;
                 if (target != null) targets.add(target);
             }
         }
@@ -147,6 +166,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
     private float lastHierarchyAlpha = Float.NaN;
     private float lastRootAlpha = Float.NaN;
     private float lastWallpaperScale = Float.NaN;
+    private int lastWorkspaceScrollX = Integer.MIN_VALUE;
+    private int lastWorkspaceScrollY = Integer.MIN_VALUE;
     private float bitmapScaleX = 1f;
     private float bitmapScaleY = 1f;
 
@@ -160,6 +181,15 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
 
     Bitmap bitmap() {
         return validFrame && frontBitmap != null && !frontBitmap.isRecycled() ? frontBitmap : null;
+    }
+
+    /** Latest useful backdrop for a glass host, if any. */
+    static Bitmap snapshotOf(View target) {
+        if (target == null) return null;
+        synchronized (CAPTURES) {
+            BackdropCapture capture = CAPTURES.get(target);
+            return capture == null ? null : capture.bitmap();
+        }
     }
 
     /** View-space → capture-bitmap scale (1,1 when capture is full resolution). */
@@ -232,6 +262,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         float hierarchyAlpha = cumulativeAlpha(owner);
         float rootAlpha = root.getAlpha();
         float wallpaperScale = WallpaperScaleTracker.current();
+        int[] workspaceScroll = readWorkspaceScroll(owner, root);
         int visibleW = 0;
         int visibleH = 0;
         if (owner.getGlobalVisibleRect(visibleScratch)) {
@@ -247,7 +278,9 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 || scaleChanged(wallpaperDepth, lastWallpaperDepth)
                 || scaleChanged(hierarchyAlpha, lastHierarchyAlpha)
                 || scaleChanged(rootAlpha, lastRootAlpha)
-                || scaleChanged(wallpaperScale, lastWallpaperScale);
+                || scaleChanged(wallpaperScale, lastWallpaperScale)
+                || workspaceScroll[0] != lastWorkspaceScrollX
+                || workspaceScroll[1] != lastWorkspaceScrollY;
         lastTargetW = w;
         lastTargetH = h;
         lastWindowX = locationScratch[0];
@@ -260,6 +293,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         lastHierarchyAlpha = hierarchyAlpha;
         lastRootAlpha = rootAlpha;
         lastWallpaperScale = wallpaperScale;
+        lastWorkspaceScrollX = workspaceScroll[0];
+        lastWorkspaceScrollY = workspaceScroll[1];
         return changed;
     }
 
@@ -291,6 +326,63 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             current = (View) parent;
         }
         return alpha;
+    }
+
+    /**
+     * Desktop page flips scroll Workspace under a stationary DragView. Tracking that scroll
+     * dirties capture even when the glass host's window position is unchanged.
+     */
+    private static int[] readWorkspaceScroll(View owner, View root) {
+        View workspace = findWorkspaceAncestor(owner);
+        if (workspace == null) workspace = findWorkspaceViaLauncher(root);
+        if (workspace == null) return new int[] { Integer.MIN_VALUE, Integer.MIN_VALUE };
+        return new int[] { workspace.getScrollX(), workspace.getScrollY() };
+    }
+
+    private static View findWorkspaceAncestor(View start) {
+        for (View current = start; current != null; ) {
+            if (isWorkspaceView(current)) return current;
+            ViewParent parent = current.getParent();
+            if (!(parent instanceof View)) break;
+            current = (View) parent;
+        }
+        return null;
+    }
+
+    private static boolean isWorkspaceView(View view) {
+        for (Class<?> c = view.getClass(); c != null; c = c.getSuperclass()) {
+            String name = c.getName();
+            if (name.equals("com.android.launcher3.Workspace")
+                    || name.equals("com.android.launcher3.OplusWorkspace")
+                    || name.endsWith(".Workspace")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static View findWorkspaceViaLauncher(View root) {
+        if (root == null) return null;
+        try {
+            Class<?> launcherClass = Class.forName("com.android.launcher3.Launcher", false,
+                    root.getContext().getClassLoader());
+            Object launcher = null;
+            try {
+                launcher = launcherClass.getMethod("getLauncher", android.content.Context.class)
+                        .invoke(null, root.getContext());
+            } catch (Throwable ignored) { }
+            if (launcher == null) {
+                try {
+                    Object tracker = launcherClass.getField("ACTIVITY_TRACKER").get(null);
+                    launcher = tracker.getClass().getMethod("getCreatedActivity").invoke(tracker);
+                } catch (Throwable ignored) { }
+            }
+            if (launcher == null) return null;
+            Object workspace = launcherClass.getMethod("getWorkspace").invoke(launcher);
+            return workspace instanceof View ? (View) workspace : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     /**
@@ -355,9 +447,26 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             canvas.scale(scale, scale);
             translateRootToTarget(root, target, canvas);
             drawWallpaper(root, canvas);
+            // Wallpaper (+ hierarchy). Apps and folders are pasted after restore into the
+            // sample so AGSL can refract them. Folder LiquidGlass plates are HW-rasterized
+            // first (GlassHwRasterizer), then copied in as software bitmaps.
+            View dragView = dragViewAncestor(target);
+            float oldDragAlpha = dragView == null ? 1f : dragView.getAlpha();
             owner.setAlpha(0f);
-            root.draw(canvas);
-            drawOverlaySource(target, canvas);
+            if (dragView != null) dragView.setAlpha(0f);
+            try {
+                root.draw(canvas);
+            } catch (Throwable ignored) {
+            } finally {
+                if (dragView != null) dragView.setAlpha(oldDragAlpha);
+            }
+            canvas.restore();
+            canvas.save();
+            canvas.scale(scale, scale);
+            try {
+                DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
+            } catch (Throwable ignored) {
+            }
             canvas.restore();
             // Never publish empty/near-black frames over a good snapshot. ColorOS sets DragLayer
             // alpha to 0 while locked; later frames used to skip the pixel scan once validFrame
@@ -395,24 +504,14 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 rootLocation[1] - targetLocation[1]);
     }
 
-    private static void drawOverlaySource(View target, Canvas canvas) {
-        View overlay;
-        synchronized (CAPTURES) {
-            WeakReference<View> reference = OVERLAY_SOURCES.get(target);
-            overlay = reference == null ? null : reference.get();
+    private static View dragViewAncestor(View target) {
+        for (View current = target; current != null; ) {
+            if ("DragView".equals(current.getClass().getSimpleName())) return current;
+            ViewParent parent = current.getParent();
+            if (!(parent instanceof View)) break;
+            current = (View) parent;
         }
-        if (overlay == null || !overlay.isShown() || overlay.getWidth() <= 0 || overlay.getHeight() <= 0) {
-            return;
-        }
-        int[] targetLocation = new int[2];
-        int[] overlayLocation = new int[2];
-        target.getLocationInWindow(targetLocation);
-        overlay.getLocationInWindow(overlayLocation);
-        int save = canvas.save();
-        canvas.translate(overlayLocation[0] - targetLocation[0],
-                overlayLocation[1] - targetLocation[1]);
-        overlay.draw(canvas);
-        canvas.restoreToCount(save);
+        return null;
     }
 
     private boolean isMeaningful(Bitmap bitmap) {

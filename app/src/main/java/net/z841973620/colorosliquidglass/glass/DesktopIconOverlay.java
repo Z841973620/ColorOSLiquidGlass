@@ -15,6 +15,7 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.widget.TextView;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -35,10 +36,17 @@ final class DesktopIconOverlay {
     private static final ThreadLocal<Integer> DEPTH =
             ThreadLocal.withInitial(() -> 0);
     private static final Map<View, FolderSnap> FOLDER_SNAPS = new WeakHashMap<>();
+    private static final Map<View, WidgetSnap> WIDGET_SNAPS = new WeakHashMap<>();
 
     private static final class FolderSnap {
         Bitmap bitmap;
         Bitmap plateSource;
+        int width;
+        int height;
+    }
+
+    private static final class WidgetSnap {
+        Bitmap bitmap;
         int width;
         int height;
     }
@@ -55,28 +63,34 @@ final class DesktopIconOverlay {
         if (glassHost == null || canvas == null) return;
         if (findDragView(glassHost) == null) return;
         View seed = BackdropCapture.overlaySourceOf(glassHost);
-        ViewGroup icons = shortcutsAndWidgetsOf(seed);
-        if (icons == null) return;
+        List<ViewGroup> containers = iconContainersUnderGlass(seed, glassHost);
+        if (containers.isEmpty()) return;
         Matrix targetToGlobal = new Matrix();
         glassHost.transformMatrixToGlobal(targetToGlobal);
         Matrix globalToTarget = new Matrix();
         if (!targetToGlobal.invert(globalToTarget)) return;
 
-        for (int i = 0; i < icons.getChildCount(); i++) {
-            View child = icons.getChildAt(i);
-            if (child == null || child.getVisibility() != View.VISIBLE) continue;
-            if (child.getWidth() <= 0 || child.getHeight() <= 0) continue;
-            if (!intersectsOnScreen(glassHost, child)) continue;
-            View item = applicationChild(child);
-            if (item == null || isDragSourceOrSelf(glassHost, item)) continue;
-            try {
-                if (isFolderIcon(item)) {
-                    paintFolderIntoSample(item, canvas, globalToTarget);
-                } else {
-                    paintAppIcon(item, canvas, globalToTarget);
-                    paintAppLabel(item, canvas, globalToTarget);
+        for (ViewGroup icons : containers) {
+            for (int i = 0; i < icons.getChildCount(); i++) {
+                View child = icons.getChildAt(i);
+                if (child == null || child.getVisibility() != View.VISIBLE) continue;
+                if (child.getWidth() <= 0 || child.getHeight() <= 0) continue;
+                if (!intersectsOnScreen(glassHost, child)) continue;
+                View host = resolveDesktopItem(child);
+                if (host == null || isDragSourceOrSelf(glassHost, host)) continue;
+                try {
+                    if (isFolderIcon(host) || isFolderIcon(child)) {
+                        paintFolderIntoSample(isFolderIcon(host) ? host : child,
+                                canvas, globalToTarget);
+                    } else if (isWidgetOrCard(host) || isWidgetOrCard(child)) {
+                        paintWidget(isWidgetOrCard(host) ? host : child,
+                                canvas, globalToTarget);
+                    } else {
+                        paintAppIcon(host, canvas, globalToTarget);
+                        paintAppLabel(host, canvas, globalToTarget);
+                    }
+                } catch (Throwable ignored) {
                 }
-            } catch (Throwable ignored) {
             }
         }
     }
@@ -88,6 +102,12 @@ final class DesktopIconOverlay {
             }
         }
         FOLDER_SNAPS.clear();
+        for (WidgetSnap snap : WIDGET_SNAPS.values()) {
+            if (snap != null && snap.bitmap != null && !snap.bitmap.isRecycled()) {
+                snap.bitmap.recycle();
+            }
+        }
+        WIDGET_SNAPS.clear();
     }
 
     /** Skip the dragged folder / glass host's own FolderIcon. */
@@ -142,6 +162,114 @@ final class DesktopIconOverlay {
         if (bitmap == null || bitmap.isRecycled()) return;
         BITMAP_PAINT.setAlpha(255);
         canvas.drawBitmap(bitmap, null, dest, BITMAP_PAINT);
+    }
+
+    /**
+     * Widgets have no FastBitmap. Offscreen HW rasterize (same idea as folder plates);
+     * never hide DragView / PixelCopy the window.
+     */
+    private static void paintWidget(View host, Canvas canvas, Matrix globalToTarget) {
+        if (host == null) return;
+        View content = widgetContentView(host);
+        int w = content.getWidth();
+        int h = content.getHeight();
+        if (w <= 0 || h <= 0) {
+            content = host;
+            w = host.getWidth();
+            h = host.getHeight();
+        }
+        if (w <= 0 || h <= 0) return;
+        Bitmap snap = widgetCompositeBitmap(host, content, w, h);
+        if (snap == null || snap.isRecycled()) return;
+        View mapped = (snap.getWidth() == host.getWidth() && snap.getHeight() == host.getHeight())
+                ? host : content;
+        RectF dest = mapItemRectToTarget(mapped,
+                new Rect(0, 0, snap.getWidth(), snap.getHeight()), globalToTarget);
+        if (dest == null || dest.width() < 1f || dest.height() < 1f) return;
+        BITMAP_PAINT.setAlpha(255);
+        canvas.drawBitmap(snap, null, dest, BITMAP_PAINT);
+    }
+
+    private static Bitmap widgetCompositeBitmap(View host, View content, int width, int height) {
+        WidgetSnap cached = WIDGET_SNAPS.get(host);
+        if (cached != null && cached.bitmap != null && !cached.bitmap.isRecycled()
+                && cached.width == width && cached.height == height) {
+            return cached.bitmap;
+        }
+        final View drawTarget = content;
+        Bitmap rendered = GlassHwRasterizer.render(width, height, drawTarget::draw);
+        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+            rendered = rasterizeViewSoftware(drawTarget, width, height);
+        }
+        if ((rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered))
+                && drawTarget != host) {
+            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+            rendered = GlassHwRasterizer.render(host.getWidth(), host.getHeight(), host::draw);
+            if (rendered != null && !isMostlyEmpty(rendered)) {
+                width = host.getWidth();
+                height = host.getHeight();
+            } else if (rendered != null) {
+                rendered.recycle();
+                rendered = null;
+            }
+        }
+        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+            return null;
+        }
+        WidgetSnap snap = new WidgetSnap();
+        snap.bitmap = rendered;
+        snap.width = width;
+        snap.height = height;
+        WidgetSnap previous = WIDGET_SNAPS.put(host, snap);
+        if (previous != null && previous.bitmap != null && previous.bitmap != rendered
+                && !previous.bitmap.isRecycled()) {
+            previous.bitmap.recycle();
+        }
+        return rendered;
+    }
+
+    private static boolean isMostlyEmpty(Bitmap bitmap) {
+        if (bitmap == null || bitmap.isRecycled()) return true;
+        int w = bitmap.getWidth();
+        int h = bitmap.getHeight();
+        if (w <= 0 || h <= 0) return true;
+        int stepX = Math.max(1, w / 6);
+        int stepY = Math.max(1, h / 6);
+        int opaque = 0;
+        for (int y = stepY / 2; y < h; y += stepY) {
+            for (int x = stepX / 2; x < w; x += stepX) {
+                if (((bitmap.getPixel(x, y) >>> 24) & 0xff) > 16) opaque++;
+            }
+        }
+        return opaque < 2;
+    }
+
+    private static Bitmap rasterizeViewSoftware(View view, int width, int height) {
+        if (view == null || width <= 0 || height <= 0) return null;
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        try {
+            view.draw(new Canvas(bitmap));
+        } catch (Throwable ignored) {
+            bitmap.recycle();
+            return null;
+        }
+        return bitmap;
+    }
+
+    private static View widgetContentView(View host) {
+        Object view = invokeNoArgs(host, "getWidgetView");
+        if (view instanceof View && ((View) view).getWidth() > 0
+                && ((View) view).getHeight() > 0) {
+            return (View) view;
+        }
+        view = invokeNoArgs(host, "getWidgetChild");
+        if (view instanceof View && ((View) view).getWidth() > 0
+                && ((View) view).getHeight() > 0) {
+            return (View) view;
+        }
+        return host;
     }
 
     private static void paintAppLabel(View item, Canvas canvas, Matrix globalToTarget) {
@@ -402,9 +530,57 @@ final class DesktopIconOverlay {
         return null;
     }
 
+    /**
+     * All ShortcutAndWidgetContainers whose page intersects the glass.
+     * Cross-page drag must not depend on a single (possibly stale) CellLayout seed —
+     * paint every on-screen page under the finger.
+     */
+    private static List<ViewGroup> iconContainersUnderGlass(View seed, View glassHost) {
+        List<ViewGroup> out = new ArrayList<>();
+        ViewGroup primary = shortcutsAndWidgetsOf(seed);
+        if (primary != null) out.add(primary);
+        View workspace = findWorkspaceAncestor(seed != null ? seed : glassHost);
+        if (workspace instanceof ViewGroup) {
+            ViewGroup pages = (ViewGroup) workspace;
+            for (int i = 0; i < pages.getChildCount(); i++) {
+                View page = pages.getChildAt(i);
+                if (page == null || page.getWidth() <= 0 || page.getHeight() <= 0) continue;
+                if (!intersectsOnScreen(glassHost, page)) continue;
+                ViewGroup icons = shortcutsAndWidgetsOf(page);
+                if (icons != null && !out.contains(icons)) out.add(icons);
+            }
+        }
+        return out;
+    }
+
+    private static View findWorkspaceAncestor(View start) {
+        for (View current = start; current != null; ) {
+            String name = current.getClass().getSimpleName();
+            if (name != null && name.contains("Workspace") && !name.contains("Cell")) {
+                return current;
+            }
+            Object got = invokeNoArgs(current, "getWorkspace");
+            if (got instanceof View) return (View) got;
+            ViewParent parent = current.getParent();
+            if (!(parent instanceof View)) break;
+            current = (View) parent;
+        }
+        return null;
+    }
+
     private static View applicationChild(View item) {
         Object child = invokeNoArgs(item, "getApplicationChild");
         return child instanceof View ? (View) child : item;
+    }
+
+    private static View resolveDesktopItem(View child) {
+        if (child == null) return null;
+        if (isWrapContainer(child)) {
+            Object target = invokeNoArgs(child, "curWidgetView");
+            if (!(target instanceof View)) target = invokeNoArgs(child, "getTargetView");
+            if (target instanceof View) return (View) target;
+        }
+        return applicationChild(child);
     }
 
     private static boolean intersectsOnScreen(View a, View b) {
@@ -423,10 +599,37 @@ final class DesktopIconOverlay {
     }
 
     private static boolean isFolderIcon(View view) {
-        for (Class<?> c = view.getClass(); c != null; c = c.getSuperclass()) {
+        for (Class<?> c = view == null ? null : view.getClass(); c != null; c = c.getSuperclass()) {
             if ("FolderIcon".equals(c.getSimpleName())) return true;
         }
         return false;
+    }
+
+    private static boolean isWrapContainer(View view) {
+        for (Class<?> c = view == null ? null : view.getClass(); c != null; c = c.getSuperclass()) {
+            String name = c.getSimpleName();
+            if (name == null) continue;
+            if (name.contains("WrapWidget") || name.contains("WrapCard")
+                    || name.contains("WrapMultiSize") || name.contains("WrapAdaptive")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isWidgetOrCard(View view) {
+        for (Class<?> c = view == null ? null : view.getClass(); c != null; c = c.getSuperclass()) {
+            String name = c.getSimpleName();
+            if (name == null) continue;
+            if (name.contains("AppWidgetHostView")
+                    || name.contains("LauncherAppWidget")
+                    || name.equals("LauncherCardView")
+                    || name.equals("TitleCardView")
+                    || name.contains("CardHostView")) {
+                return true;
+            }
+        }
+        return isWrapContainer(view);
     }
 
     private static Drawable iconDrawableOf(View iconView) {

@@ -21,6 +21,10 @@ import java.util.WeakHashMap;
  * Captures a target-local backdrop for one Launcher folder background.
  * Large folders are expensive to sample, so capture is dirty-driven, downscaled, and
  * never re-entered from the invalidate that publishes a new frame.
+ * <p>
+ * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
+ * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
+ * software-draw the hierarchy.
  */
 final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         View.OnAttachStateChangeListener {
@@ -57,14 +61,23 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
     }
 
     static void setOverlaySource(View target, View overlay) {
+        View previous;
         synchronized (CAPTURES) {
+            WeakReference<View> reference = target == null ? null : OVERLAY_SOURCES.get(target);
+            previous = reference == null ? null : reference.get();
             if (target == null || overlay == null || overlay == target) {
                 if (target != null) OVERLAY_SOURCES.remove(target);
-                return;
+            } else {
+                OVERLAY_SOURCES.put(target, new WeakReference<>(overlay));
+                BackdropCapture capture = CAPTURES.get(target);
+                if (capture != null) {
+                    capture.markDirty();
+                    capture.dragSeedGeneration++;
+                }
             }
-            OVERLAY_SOURCES.put(target, new WeakReference<>(overlay));
-            BackdropCapture capture = CAPTURES.get(target);
-            if (capture != null) capture.markDirty();
+        }
+        if (previous != overlay) {
+            DesktopIconOverlay.clearFolderSnaps();
         }
         if (target != null) target.invalidate();
     }
@@ -170,6 +183,9 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
     private int lastWorkspaceScrollY = Integer.MIN_VALUE;
     private float bitmapScaleX = 1f;
     private float bitmapScaleY = 1f;
+    /** Bumps when overlay CellLayout changes so cross-page samples always publish. */
+    private int dragSeedGeneration;
+    private int publishedDragSeedGeneration = -1;
 
     private BackdropCapture(View target) {
         targetRef = new WeakReference<>(target);
@@ -432,6 +448,8 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         float oldAlpha = owner.getAlpha();
         recording = true;
         boolean complete = false;
+        boolean dragGlass = overlaySourceOf(target) != null && dragViewAncestor(target) != null;
+        int seedGen = dragSeedGeneration;
         try {
             int viewW = target.getWidth();
             int viewH = target.getHeight();
@@ -447,32 +465,33 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             canvas.scale(scale, scale);
             translateRootToTarget(root, target, canvas);
             drawWallpaper(root, canvas);
-            // Wallpaper (+ hierarchy). Apps and folders are pasted after restore into the
-            // sample so AGSL can refract them. Folder LiquidGlass plates are HW-rasterized
-            // first (GlassHwRasterizer), then copied in as software bitmaps.
-            View dragView = dragViewAncestor(target);
-            float oldDragAlpha = dragView == null ? 1f : dragView.getAlpha();
-            owner.setAlpha(0f);
-            if (dragView != null) dragView.setAlpha(0f);
-            try {
-                root.draw(canvas);
-            } catch (Throwable ignored) {
-            } finally {
-                if (dragView != null) dragView.setAlpha(oldDragAlpha);
+            if (dragGlass) {
+                // Never hide *DragView during drag capture — that flickers the preview.
+                canvas.restore();
+                canvas.save();
+                canvas.scale(scale, scale);
+                try {
+                    DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
+                } catch (Throwable ignored) {
+                }
+                canvas.restore();
+            } else {
+                View dragView = dragViewAncestor(target);
+                float oldDragAlpha = dragView == null ? 1f : dragView.getAlpha();
+                owner.setAlpha(0f);
+                if (dragView != null) dragView.setAlpha(0f);
+                try {
+                    root.draw(canvas);
+                } catch (Throwable ignored) {
+                } finally {
+                    if (dragView != null) dragView.setAlpha(oldDragAlpha);
+                }
+                canvas.restore();
             }
-            canvas.restore();
-            canvas.save();
-            canvas.scale(scale, scale);
-            try {
-                DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
-            } catch (Throwable ignored) {
-            }
-            canvas.restore();
-            // Never publish empty/near-black frames over a good snapshot. ColorOS sets DragLayer
-            // alpha to 0 while locked; later frames used to skip the pixel scan once validFrame
-            // was true and could replace a useful backdrop with garbage until the next idle tick.
-            // Forced captures may only bootstrap the first frame.
-            complete = isMeaningful(backBitmap) || (forced && !validFrame);
+            boolean seedChanged = dragGlass && seedGen != publishedDragSeedGeneration;
+            complete = isMeaningful(backBitmap)
+                    || (forced && !validFrame)
+                    || (dragGlass && (forced || seedChanged));
         } catch (Throwable ignored) {
             // Keep the previous useful frame.
         } finally {
@@ -484,6 +503,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             frontBitmap = backBitmap;
             backBitmap = previous;
             validFrame = true;
+            if (dragGlass) publishedDragSeedGeneration = seedGen;
             skipCaptureFromSelfInvalidate = true;
             target.invalidate();
         }
@@ -504,9 +524,11 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 rootLocation[1] - targetLocation[1]);
     }
 
+    /** Match DragView and OEM subclasses (OplusDragView, …). */
     private static View dragViewAncestor(View target) {
         for (View current = target; current != null; ) {
-            if ("DragView".equals(current.getClass().getSimpleName())) return current;
+            String name = current.getClass().getSimpleName();
+            if (name != null && name.endsWith("DragView")) return current;
             ViewParent parent = current.getParent();
             if (!(parent instanceof View)) break;
             current = (View) parent;

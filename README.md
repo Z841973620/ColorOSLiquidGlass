@@ -4,6 +4,6 @@
 
 使用 LSPosed API 101
 
-目前适用于 ColorOS 16，已完成文件夹部分的样式修改
+目前适用于 ColorOS 16，已完成文件夹的样式修改
 
 <img width="304" height="660" alt="Screenshot_01" src="imgs/Screenshot_01.jpg" />

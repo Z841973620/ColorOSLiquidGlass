@@ -348,9 +348,12 @@ public final class ModuleMain extends XposedModule {
                                 // not via translucent glass or software sample paste.
                                 GlassDrawable glass = GlassInstaller.get((View) content);
                                 if (glass != null) glass.setAlpha(255);
-                                View page = desktopPageUnderDrag(chain.getThisObject());
-                                if (page != null) {
-                                    GlassInstaller.setOverlaySource((View) content, page);
+                                Object workspace = chain.getThisObject();
+                                View seed = workspace instanceof View
+                                        ? (View) workspace
+                                        : desktopPageUnderDrag(workspace);
+                                if (seed != null) {
+                                    GlassInstaller.setOverlaySource((View) content, seed);
                                 }
                             }
                         } catch (Throwable e) {
@@ -1391,7 +1394,7 @@ public final class ModuleMain extends XposedModule {
             } catch (Throwable ignored) { }
             try {
                 return launcherClass.getMethod("getLauncher", android.content.Context.class)
-                        .invoke(null, null);
+                        .invoke(null, (Object) null);
             } catch (Throwable ignored) { }
         } catch (Throwable ignored) { }
         return null;
@@ -1571,8 +1574,29 @@ public final class ModuleMain extends XposedModule {
     private void hookWorkspaceDragOver(ClassLoader cl) {
         after("com.android.launcher3.OplusWorkspace", cl, "onDragOver", this::syncDragOverlaySource);
         after("com.android.launcher3.Workspace", cl, "onDragOver", this::syncDragOverlaySource);
-        // Page-edge auto-scroll moves Workspace under a stationary DragView; reassert glass and
-        // force a fresh backdrop sample for the whole scroll window.
+        for (String className : new String[] {
+                "com.android.launcher3.OplusWorkspace",
+                "com.android.launcher3.Workspace"
+        }) {
+            try {
+                Class<?> c = Class.forName(className, false, cl);
+                for (Method m : c.getDeclaredMethods()) {
+                    if (m.isBridge() || m.isSynthetic()) continue;
+                    if (!m.getName().equals("setCurrentDropLayout")) continue;
+                    hookOnce(m, chain -> {
+                        Object result = chain.proceed();
+                        try {
+                            if (folderDragActive) syncDragOverlaySource(chain.getThisObject());
+                        } catch (Throwable e) {
+                            log(5, TAG, className + ".setCurrentDropLayout overlay sync failed", e);
+                        }
+                        return result;
+                    });
+                }
+            } catch (Throwable e) {
+                log(5, TAG, className + " setCurrentDropLayout hook unavailable", e);
+            }
+        }
         for (String className : new String[] {
                 "com.android.launcher3.OplusWorkspace",
                 "com.android.launcher3.Workspace"
@@ -1603,9 +1627,6 @@ public final class ModuleMain extends XposedModule {
     }
 
     private void syncDragOverlaySource(Object workspace) {
-        // Bind the desktop CellLayout so GlassDrawable can HW-draw icons under the dragged
-        // folder glass. Software backdrop capture cannot see ColorOS multi-node icon RenderNodes
-        // (setAlpha(0) proved the live desktop layer is correct).
         View content = findFolderDragContentView(null);
         View desktopPage = desktopPageUnderDrag(workspace);
         Object hover = dragHoverView(workspace);
@@ -1615,7 +1636,13 @@ public final class ModuleMain extends XposedModule {
         if (content != null && GlassInstaller.get(content) != null) {
             GlassDrawable glass = GlassInstaller.get(content);
             if (glass != null) glass.setAlpha(255);
-            GlassInstaller.setOverlaySource(content, desktopPage);
+            // Prefer Workspace as seed so DesktopIconOverlay can scan all intersecting pages.
+            View seed = workspace instanceof View ? (View) workspace : desktopPage;
+            if (seed != null) {
+                GlassInstaller.setOverlaySource(content, seed);
+            } else if (desktopPage != null) {
+                GlassInstaller.setOverlaySource(content, desktopPage);
+            }
             if (folderDragActive) {
                 GlassInstaller.forceCapture(content);
                 content.invalidate();
@@ -1629,12 +1656,31 @@ public final class ModuleMain extends XposedModule {
     }
 
     /**
-     * CellLayout currently under the dragged folder — same page OEM uses for
-     * {@code getShortcutsAndWidgets()} during TOGGLE_BAR.
+     * Prefer OEM {@code getCurrentDropLayout()} (mNextPage || mCurrentPage); skip Hotseat.
      */
     private View desktopPageUnderDrag(Object workspace) {
+        if (workspace == null) return null;
+        try {
+            Object drop = invokeNoArgs(workspace, "getCurrentDropLayout");
+            if (drop instanceof View) return (View) drop;
+        } catch (Throwable ignored) { }
+        try {
+            Object pageIndex = invokeNoArgs(workspace, "getNextPage");
+            if (!(pageIndex instanceof Number) || ((Number) pageIndex).intValue() < 0) {
+                pageIndex = invokeNoArgs(workspace, "getCurrentPage");
+            }
+            if (pageIndex instanceof Number) {
+                Object page = invoke(workspace, "getPageAt",
+                        new Class<?>[] { int.class },
+                        ((Number) pageIndex).intValue());
+                if (page instanceof View) return (View) page;
+            }
+        } catch (Throwable ignored) { }
         Object layout = field(workspace, "mDragTargetLayout");
-        if (layout instanceof View) return (View) layout;
+        if (layout instanceof View) {
+            String name = layout.getClass().getSimpleName();
+            if (name == null || !name.contains("Hotseat")) return (View) layout;
+        }
         try {
             Object pageIndex = invokeNoArgs(workspace, "getCurrentPage");
             if (pageIndex instanceof Number) {
@@ -1705,7 +1751,10 @@ public final class ModuleMain extends XposedModule {
             GlassDrawable glass = GlassInstaller.get(content);
             if (glass != null) glass.setAlpha(255);
         }
-        if (GlassInstaller.get(content) != null) {
+        Object workspace = invokeNoArgs(findActiveLauncher(), "getWorkspace");
+        if (workspace != null) {
+            syncDragOverlaySource(workspace);
+        } else if (GlassInstaller.get(content) != null) {
             GlassInstaller.forceCapture(content);
             content.invalidate();
         }

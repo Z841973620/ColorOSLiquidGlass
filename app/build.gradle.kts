@@ -29,8 +29,8 @@ android {
         applicationId = "net.z841973620.colorosliquidglass"
         minSdk = 33
         targetSdk = 33
-        versionCode = 6
-        versionName = "0.3.0"
+        versionCode = 7
+        versionName = "0.3.1"
     }
 
     val storeFilePath = signingProp("RELEASE_STORE_FILE")

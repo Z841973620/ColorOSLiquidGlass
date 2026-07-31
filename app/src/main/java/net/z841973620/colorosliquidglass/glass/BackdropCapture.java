@@ -4,6 +4,7 @@ import android.app.WallpaperManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.view.View;
@@ -497,13 +498,49 @@ import java.util.WeakHashMap;
         return 1f;
     }
 
+    /**
+     * Map root drawing into the target's local coordinates.
+     * Unrotated hosts (folders, portrait 清除) keep the integer window-location
+     * translate that already matched pixels. Recents landscape applies
+     * {@code setRotation(±90/270)} on {@code OplusClearAllPanelView}; that case
+     * needs a full root→target matrix so sampling follows the rotated local axes.
+     */
     private static void translateRootToTarget(View root, View target, Canvas canvas) {
+        if (Math.abs(cumulativeRotationDegrees(target)) >= 0.5f
+                && concatRootToTarget(root, target, canvas)) {
+            return;
+        }
         int[] rootLocation = new int[2];
         int[] targetLocation = new int[2];
         root.getLocationInWindow(rootLocation);
         target.getLocationInWindow(targetLocation);
         canvas.translate(rootLocation[0] - targetLocation[0],
                 rootLocation[1] - targetLocation[1]);
+    }
+
+    private static boolean concatRootToTarget(View root, View target, Canvas canvas) {
+        Matrix rootGlobal = new Matrix();
+        Matrix targetGlobal = new Matrix();
+        root.transformMatrixToGlobal(rootGlobal);
+        target.transformMatrixToGlobal(targetGlobal);
+        Matrix globalToTarget = new Matrix();
+        if (!targetGlobal.invert(globalToTarget)) return false;
+        Matrix rootToTarget = new Matrix();
+        rootToTarget.setConcat(globalToTarget, rootGlobal);
+        canvas.concat(rootToTarget);
+        return true;
+    }
+
+    /** Sum of {@link View#getRotation()} from {@code view} up through parents. */
+    private static float cumulativeRotationDegrees(View view) {
+        float degrees = 0f;
+        for (View current = view; current != null; ) {
+            degrees += current.getRotation();
+            ViewParent parent = current.getParent();
+            if (!(parent instanceof View)) break;
+            current = (View) parent;
+        }
+        return degrees;
     }
 
     /** Match DragView and OEM subclasses (OplusDragView, …). */

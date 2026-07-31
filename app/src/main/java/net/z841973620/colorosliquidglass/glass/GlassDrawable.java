@@ -70,25 +70,18 @@ public final class GlassDrawable extends Drawable {
 
             half4 sampleBackdrop(float2 coord) {
                 // RuntimeShader does not reliably honor BitmapShader local matrices, so map
-                // view-space coords onto a possibly-downscaled capture bitmap here.
+                // view-space coords onto the capture bitmap here.
                 return image.eval((coord + sampleOrigin) * sampleScale);
             }
 
             half4 vibrant(float2 coord) {
-                float r = blurRadius;
-                half4 c;
-                if (r <= 0.1) {
-                    c = sampleBackdrop(coord);
-                } else {
-                    c = sampleBackdrop(coord) * 0.28;
-                    c += sampleBackdrop(coord + float2( r, 0.0)) * 0.18;
-                    c += sampleBackdrop(coord + float2(-r, 0.0)) * 0.18;
-                    c += sampleBackdrop(coord + float2(0.0,  r)) * 0.18;
-                    c += sampleBackdrop(coord + float2(0.0, -r)) * 0.18;
-                }
+                // Blur is applied to the capture bitmap before it reaches this shader
+                // (same role as Compose RenderEffect.blur in the console preview).
+                half4 c = sampleBackdrop(coord);
                 half luminance = dot(c.rgb, half3(0.2126, 0.7152, 0.0722));
                 c.rgb = mix(half3(luminance), c.rgb, 1.18);
                 c.rgb = (c.rgb - 0.5) * 1.04 + 0.5;
+                c.a = 1.0;
                 return c;
             }
 
@@ -145,6 +138,9 @@ public final class GlassDrawable extends Drawable {
     private final RuntimeShader runtimeShader;
     private final BackdropCapture backdrop;
     private Bitmap cachedSnapshot;
+    private Bitmap cachedSnapshotSource;
+    private Bitmap cachedBlurredSnapshot;
+    private float cachedBlurRadiusPx = -1f;
     private BitmapShader cachedImageShader;
     private boolean shaderFailureLogged;
     private int alpha = 255;
@@ -208,10 +204,12 @@ public final class GlassDrawable extends Drawable {
         if (canvas.isHardwareAccelerated() && runtimeShader != null
                 && snapshot != null && !snapshot.isRecycled()) {
             try {
-                if (snapshot != cachedSnapshot || cachedImageShader == null) {
-                    cachedSnapshot = snapshot;
+                float blurPx = effectiveShaderBlurRadius();
+                Bitmap shaderBitmap = blurredBackdrop(snapshot, blurPx);
+                if (shaderBitmap != cachedSnapshot || cachedImageShader == null) {
+                    cachedSnapshot = shaderBitmap;
                     cachedImageShader = new BitmapShader(
-                            snapshot, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+                            shaderBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
                 }
                 // Identity matrix: scaling is applied in AGSL via sampleScale.
                 cachedImageShader.setLocalMatrix(null);
@@ -225,7 +223,8 @@ public final class GlassDrawable extends Drawable {
                 // float4 must use the 4-float overload; float[] is for float array uniforms.
                 runtimeShader.setFloatUniform("cornerRadii",
                         corner[0], corner[1], corner[2], corner[3]);
-                runtimeShader.setFloatUniform("blurRadius", effectiveShaderBlurRadius());
+                // Blur already baked into shaderBitmap (console uses RenderEffect the same way).
+                runtimeShader.setFloatUniform("blurRadius", 0f);
                 float intensity = clamp01(config.glassIntensity);
                 runtimeShader.setFloatUniform("refractionHeight",
                         Math.max(0f, config.refractionHeight) * intensity * min * 0.5f);
@@ -285,6 +284,39 @@ public final class GlassDrawable extends Drawable {
 
     private float effectiveShaderBlurRadius() {
         return Math.max(0f, config.blurRadius) * owner.getResources().getDisplayMetrics().density;
+    }
+
+    /**
+     * Blur the capture the same way the console applies {@code blur()} before lens —
+     * never via sparse AGSL taps (those caused ghosting on desktop glass).
+     */
+    private Bitmap blurredBackdrop(Bitmap snapshot, float blurPx) {
+        if (blurPx < 0.5f) {
+            recycleBlurredCache();
+            return snapshot;
+        }
+        if (cachedBlurredSnapshot != null && !cachedBlurredSnapshot.isRecycled()
+                && cachedSnapshotSource == snapshot
+                && Math.abs(cachedBlurRadiusPx - blurPx) < 0.25f) {
+            return cachedBlurredSnapshot;
+        }
+        recycleBlurredCache();
+        Bitmap blurred = BackdropBlur.blur(snapshot, blurPx);
+        if (blurred == null || blurred == snapshot) return snapshot;
+        cachedSnapshotSource = snapshot;
+        cachedBlurredSnapshot = blurred;
+        cachedBlurRadiusPx = blurPx;
+        return blurred;
+    }
+
+    private void recycleBlurredCache() {
+        if (cachedBlurredSnapshot != null && cachedBlurredSnapshot != cachedSnapshotSource
+                && !cachedBlurredSnapshot.isRecycled()) {
+            cachedBlurredSnapshot.recycle();
+        }
+        cachedBlurredSnapshot = null;
+        cachedSnapshotSource = null;
+        cachedBlurRadiusPx = -1f;
     }
 
     private static float clamp01(float value) {

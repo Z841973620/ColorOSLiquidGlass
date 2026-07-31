@@ -8,6 +8,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.ImageView;
 
 import io.github.libxposed.api.XposedModule;
@@ -323,6 +324,69 @@ public final class ModuleMain extends XposedModule {
         if (blur instanceof View) ((View) blur).setAlpha(0f);
     }
 
+    /**
+     * Folder-only drag preview glass (ported from 408f380 onto the pre-widget-chrome tree).
+     * Widget/card DragViews must never receive folder move glass via install/refresh paths.
+     */
+    private static boolean isFolderDragSource(Object source) {
+        return source != null && (
+                isClassOrSubclass(source, "com.android.launcher3.folder.FolderIcon")
+                        || isClassOrSubclass(source, "com.android.launcher3.folder.FlexibleFolderIcon")
+                        || source.getClass().getName().contains("FolderIcon"));
+    }
+
+    /** DragView content that belongs to a widget/card — must never receive folder drag glass. */
+    private static boolean isWidgetDragContent(View content) {
+        if (content == null) return false;
+        String n = content.getClass().getName();
+        if (n.contains("AppWidgetHostView") || n.contains("WrapWidget")
+                || n.contains("LauncherCard") || n.contains("WrapCard")
+                || n.contains("WrapAdaptive") || n.contains("WrapMultiSize")
+                || n.contains("TitleCard") || n.contains("StackGroup")) {
+            return true;
+        }
+        for (Class<?> c = content.getClass(); c != null; c = c.getSuperclass()) {
+            String simple = c.getSimpleName();
+            if (simple != null && simple.contains("AppWidgetHostView")) return true;
+        }
+        return false;
+    }
+
+    /** Strip any mistaken DragView glass from a non-folder drag preview. */
+    private void stripWidgetDragViewGlass(Object dragView) {
+        if (dragView == null) return;
+        try {
+            Object content = invokeNoArgs(dragView, "getContentView");
+            if (content instanceof View) {
+                View view = (View) content;
+                GlassInstaller.setOverlaySource(view, null);
+                if (GlassInstaller.get(view) != null) {
+                    GlassInstaller.uninstall(view);
+                } else if (view.getBackground() instanceof GlassDrawable) {
+                    view.setBackground(null);
+                }
+                if (view instanceof ViewGroup) {
+                    ViewGroup group = (ViewGroup) view;
+                    for (int i = 0; i < group.getChildCount(); i++) {
+                        View child = group.getChildAt(i);
+                        if (child == null) continue;
+                        GlassInstaller.setOverlaySource(child, null);
+                        if (GlassInstaller.get(child) != null) GlassInstaller.uninstall(child);
+                        else if (child.getBackground() instanceof GlassDrawable) {
+                            child.setBackground(null);
+                        }
+                    }
+                }
+            }
+            if (dragView instanceof View) {
+                View dv = (View) dragView;
+                GlassInstaller.setOverlaySource(dv, null);
+                if (GlassInstaller.get(dv) != null) GlassInstaller.uninstall(dv);
+                else if (dv.getBackground() instanceof GlassDrawable) dv.setBackground(null);
+            }
+        } catch (Throwable ignored) { }
+    }
+
     private void hookFolderDragPreview(ClassLoader cl) {
         final String className = "com.android.launcher3.Workspace";
         try {
@@ -335,11 +399,16 @@ public final class ModuleMain extends XposedModule {
                     Object dragView = chain.getArg(1);
                     // ColorOS copies LayerBlurDrawable onto the drag preview here. Skip that
                     // OEM blur layer entirely and let LiquidGlass own the dragged folder look.
-                    if (enabled() && isClassOrSubclass(source, "com.android.launcher3.folder.FolderIcon")) {
+                    if (enabled() && isFolderDragSource(source)) {
                         try {
+                            Object content = invokeNoArgs(dragView, "getContentView");
+                            // Never install folder-drag glass onto widget/card DragView content.
+                            if (content instanceof View && isWidgetDragContent((View) content)) {
+                                stripWidgetDragViewGlass(dragView);
+                                return chain.proceed();
+                            }
                             beginFolderDrag(source);
                             clearDragBlurProp(dragView);
-                            Object content = invokeNoArgs(dragView, "getContentView");
                             if (content instanceof View) {
                                 suppressLayerBlur((View) content);
                                 GlassInstaller.installBackground((View) content, currentConfig());
@@ -361,11 +430,55 @@ public final class ModuleMain extends XposedModule {
                         }
                         return null;
                     }
-                    return chain.proceed();
+                    Object result = chain.proceed();
+                    // Non-folder: strip any folder-drag glass that leaked onto the preview.
+                    if (enabled() && dragView != null) {
+                        stripWidgetDragViewGlass(dragView);
+                    }
+                    return result;
                 });
             }
         } catch (Throwable e) {
             log(5, TAG, "Folder drag preview hook unavailable", e);
+        }
+
+        // Belt: strip widget/card DragView glass on every onDragStart.
+        try {
+            for (String dragViewClass : new String[] {
+                    "com.android.launcher3.dragndrop.OplusDragView",
+                    "com.android.launcher3.dragndrop.DragView"
+            }) {
+                Class<?> c = Class.forName(dragViewClass, false, cl);
+                for (Method m : c.getDeclaredMethods()) {
+                    if (m.isBridge() || m.isSynthetic()) continue;
+                    if (!m.getName().equals("onDragStart") || m.getParameterCount() > 2) continue;
+                    hookOnce(m, chain -> {
+                        Object result = chain.proceed();
+                        try {
+                            if (!enabled()) return result;
+                            Object dragView = chain.getThisObject();
+                            Object content = invokeNoArgs(dragView, "getContentView");
+                            if (content instanceof View && isWidgetDragContent((View) content)) {
+                                stripWidgetDragViewGlass(dragView);
+                                if (folderDragActive && !isFolderDragSource(folderDragSource)) {
+                                    folderDragActive = false;
+                                    folderDragSource = null;
+                                }
+                            } else if (content instanceof View && !isFolderDragSource(folderDragSource)
+                                    && GlassInstaller.get((View) content) != null
+                                    && !folderDragActive) {
+                                // Stale glass on a non-folder preview — drop it.
+                                stripWidgetDragViewGlass(dragView);
+                            }
+                        } catch (Throwable e) {
+                            log(5, TAG, dragViewClass + ".onDragStart strip widget glass failed", e);
+                        }
+                        return result;
+                    });
+                }
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "Widget drag-start strip hook unavailable", e);
         }
     }
 
@@ -1403,6 +1516,9 @@ public final class ModuleMain extends XposedModule {
     private volatile Object folderDragSource;
 
     private void beginFolderDrag(Object folderIcon) {
+        // Folder-only flag. Widgets must never flip this on — refreshFolderDragGlass would
+        // otherwise reinstall glass onto whatever DragView content is currently moving.
+        if (!isFolderDragSource(folderIcon)) return;
         folderDragActive = true;
         folderDragSource = folderIcon;
         forceDepthBlur(folderIcon, 0f);
@@ -1416,7 +1532,11 @@ public final class ModuleMain extends XposedModule {
         // Finger-up: drop overlay seeds immediately. Otherwise the returned FolderIcon keeps
         // compositing the desktop into its own LiquidGlass (self secondary-refraction).
         try {
+            View dragContent = findFolderDragContentView(null);
             GlassInstaller.clearDragOverlays();
+            if (dragContent != null && GlassInstaller.get(dragContent) != null) {
+                GlassInstaller.uninstall(dragContent);
+            }
             if (source != null) syncFolderIconDeferred(source, true);
         } catch (Throwable ignored) { }
         // Stay suppressed while still in TOGGLE_BAR / open folder; otherwise restore.
@@ -1550,15 +1670,22 @@ public final class ModuleMain extends XposedModule {
                         Object content = invokeNoArgs(chain.getThisObject(), "getContentView");
                         if (!(content instanceof View)) return result;
                         View view = (View) content;
-                        if (folderDragActive) {
+                        // Widget / card DragView: never refresh folder glass; always strip.
+                        if (isWidgetDragContent(view) || !isFolderDragSource(folderDragSource)) {
+                            stripWidgetDragViewGlass(chain.getThisObject());
+                            if (folderDragActive && !isFolderDragSource(folderDragSource)) {
+                                folderDragActive = false;
+                                folderDragSource = null;
+                            }
+                            return result;
+                        }
+                        if (folderDragActive && isFolderDragSource(folderDragSource)) {
                             // Finger motion dirties geometry; only reinstall if OEM cleared glass.
                             if (GlassInstaller.get(view) == null) {
                                 refreshFolderDragGlass(chain.getThisObject(), true);
                             } else {
                                 view.invalidate();
                             }
-                        } else if (GlassInstaller.get(view) != null) {
-                            view.invalidate();
                         }
                     } catch (Throwable e) {
                         log(5, TAG, "DragView.move glass refresh failed", e);
@@ -1586,7 +1713,9 @@ public final class ModuleMain extends XposedModule {
                     hookOnce(m, chain -> {
                         Object result = chain.proceed();
                         try {
-                            if (folderDragActive) syncDragOverlaySource(chain.getThisObject());
+                            if (folderDragActive && isFolderDragSource(folderDragSource)) {
+                                syncDragOverlaySource(chain.getThisObject());
+                            }
                         } catch (Throwable e) {
                             log(5, TAG, className + ".setCurrentDropLayout overlay sync failed", e);
                         }
@@ -1613,7 +1742,9 @@ public final class ModuleMain extends XposedModule {
                     hookOnce(m, chain -> {
                         Object result = chain.proceed();
                         try {
-                            if (folderDragActive) refreshFolderDragGlass(null, true);
+                            if (folderDragActive && isFolderDragSource(folderDragSource)) {
+                                refreshFolderDragGlass(null, true);
+                            }
                         } catch (Throwable e) {
                             log(5, TAG, className + "." + name + " drag glass refresh failed", e);
                         }
@@ -1627,23 +1758,23 @@ public final class ModuleMain extends XposedModule {
     }
 
     private void syncDragOverlaySource(Object workspace) {
-        View content = findFolderDragContentView(null);
         View desktopPage = desktopPageUnderDrag(workspace);
         Object hover = dragHoverView(workspace);
         boolean hoverIsFolder = hover != null
                 && isClassOrSubclass(hover, "com.android.launcher3.folder.FolderIcon");
 
-        if (content != null && GlassInstaller.get(content) != null) {
-            GlassDrawable glass = GlassInstaller.get(content);
-            if (glass != null) glass.setAlpha(255);
-            // Prefer Workspace as seed so DesktopIconOverlay can scan all intersecting pages.
-            View seed = workspace instanceof View ? (View) workspace : desktopPage;
-            if (seed != null) {
-                GlassInstaller.setOverlaySource(content, seed);
-            } else if (desktopPage != null) {
-                GlassInstaller.setOverlaySource(content, desktopPage);
-            }
-            if (folderDragActive) {
+        // Overlay seed only while a real folder is being dragged — never for widget DragViews.
+        if (folderDragActive && isFolderDragSource(folderDragSource)) {
+            View content = findFolderDragContentView(null);
+            if (content != null && GlassInstaller.get(content) != null) {
+                GlassDrawable glass = GlassInstaller.get(content);
+                if (glass != null) glass.setAlpha(255);
+                View seed = workspace instanceof View ? (View) workspace : desktopPage;
+                if (seed != null) {
+                    GlassInstaller.setOverlaySource(content, seed);
+                } else if (desktopPage != null) {
+                    GlassInstaller.setOverlaySource(content, desktopPage);
+                }
                 GlassInstaller.forceCapture(content);
                 content.invalidate();
             }
@@ -1742,9 +1873,9 @@ public final class ModuleMain extends XposedModule {
      * under a mostly stationary DragView, and reinstalls glass if OEM restored LayerBlur.
      */
     private void refreshFolderDragGlass(Object dragViewHint, boolean reassert) {
-        if (!enabled() || !folderDragActive) return;
+        if (!enabled() || !folderDragActive || !isFolderDragSource(folderDragSource)) return;
         View content = findFolderDragContentView(dragViewHint);
-        if (content == null) return;
+        if (content == null || isWidgetDragContent(content)) return;
         if (reassert || GlassInstaller.get(content) == null) {
             suppressLayerBlur(content);
             GlassInstaller.installBackground(content, currentConfig());
@@ -1769,7 +1900,11 @@ public final class ModuleMain extends XposedModule {
             dragView = field(dragObject, "dragView");
         }
         Object content = invokeNoArgs(dragView, "getContentView");
-        return content instanceof View ? (View) content : null;
+        if (!(content instanceof View)) return null;
+        View view = (View) content;
+        // Never treat widget/card DragView content as the folder drag glass host.
+        if (isWidgetDragContent(view)) return null;
+        return view;
     }
 
     private void hookFolderRefreshEvents(ClassLoader cl) {

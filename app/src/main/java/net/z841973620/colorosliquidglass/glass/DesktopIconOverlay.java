@@ -93,6 +93,19 @@ final class DesktopIconOverlay {
                 }
             }
         }
+
+        // Page dots sit between Workspace icons and Hotseat — not inside either container.
+        View workspace = findWorkspaceAncestor(seed != null ? seed : glassHost);
+        View pageIndicator = findPageIndicator(seed != null ? seed : glassHost, workspace);
+        if (pageIndicator != null
+                && pageIndicator.getVisibility() == View.VISIBLE
+                && pageIndicator.getAlpha() > 0.01f
+                && pageIndicator.getWidth() > 0 && pageIndicator.getHeight() > 0
+                && intersectsOnScreen(glassHost, pageIndicator)) {
+            try {
+                paintDesktopChrome(pageIndicator, canvas, globalToTarget);
+            } catch (Throwable ignored) { }
+        }
     }
 
     static void clearFolderSnaps() {
@@ -162,6 +175,36 @@ final class DesktopIconOverlay {
         if (bitmap == null || bitmap.isRecycled()) return;
         BITMAP_PAINT.setAlpha(255);
         canvas.drawBitmap(bitmap, null, dest, BITMAP_PAINT);
+    }
+
+    /**
+     * Rasterize a non-icon desktop chrome View (page indicator dots) into the sample.
+     * Same offscreen draw approach as widgets — no window PixelCopy / DragView hide.
+     */
+    private static void paintDesktopChrome(View host, Canvas canvas, Matrix globalToTarget) {
+        if (host == null) return;
+        int w = host.getWidth();
+        int h = host.getHeight();
+        if (w <= 0 || h <= 0) return;
+        Bitmap rendered = GlassHwRasterizer.render(w, h, host::draw);
+        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+            rendered = rasterizeViewSoftware(host, w, h);
+        }
+        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+            return;
+        }
+        try {
+            RectF dest = mapItemRectToTarget(host,
+                    new Rect(0, 0, rendered.getWidth(), rendered.getHeight()), globalToTarget);
+            if (dest == null || dest.width() < 1f || dest.height() < 1f) return;
+            int alpha = Math.round(255f * Math.max(0f, Math.min(1f, host.getAlpha())));
+            BITMAP_PAINT.setAlpha(alpha);
+            canvas.drawBitmap(rendered, null, dest, BITMAP_PAINT);
+        } finally {
+            if (!rendered.isRecycled()) rendered.recycle();
+        }
     }
 
     /**
@@ -533,7 +576,7 @@ final class DesktopIconOverlay {
     /**
      * All ShortcutAndWidgetContainers whose page intersects the glass.
      * Cross-page drag must not depend on a single (possibly stale) CellLayout seed —
-     * paint every on-screen page under the finger.
+     * paint every on-screen Workspace page under the finger, plus Hotseat (bottom dock).
      */
     private static List<ViewGroup> iconContainersUnderGlass(View seed, View glassHost) {
         List<ViewGroup> out = new ArrayList<>();
@@ -550,7 +593,94 @@ final class DesktopIconOverlay {
                 if (icons != null && !out.contains(icons)) out.add(icons);
             }
         }
+        // Hotseat is a CellLayout sibling of Workspace (not a Workspace page). Same paint
+        // path as desktop icons/folders — include when the glass overlaps the dock.
+        View hotseat = findHotseat(seed != null ? seed : glassHost, workspace);
+        if (hotseat != null && hotseat.getWidth() > 0 && hotseat.getHeight() > 0
+                && intersectsOnScreen(glassHost, hotseat)) {
+            ViewGroup icons = shortcutsAndWidgetsOf(hotseat);
+            if (icons != null && !out.contains(icons)) out.add(icons);
+        }
         return out;
+    }
+
+    /**
+     * ColorOS: {@code Launcher.getHotseat()} → {@code OplusHotseat} extends CellLayout.
+     * Fall back to scanning the Workspace parent (DragLayer) for a *Hotseat* child.
+     */
+    private static View findHotseat(View start, View workspace) {
+        Object launcher = findLauncher(start, workspace);
+        Object hotseat = invokeNoArgs(launcher, "getHotseat");
+        if (hotseat instanceof View) return (View) hotseat;
+
+        ViewParent parent = workspace != null ? workspace.getParent()
+                : (start != null ? start.getParent() : null);
+        if (parent instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) parent;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child == null) continue;
+                String name = child.getClass().getSimpleName();
+                if (name != null && name.contains("Hotseat")) return child;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * ColorOS: {@code Workspace.getPageIndicator()} → {@code OplusPageIndicator}
+     * (dots between icon grid and Hotseat). Also accept DragLayer siblings named *PageIndicator*.
+     */
+    private static View findPageIndicator(View start, View workspace) {
+        if (workspace != null) {
+            Object indicator = invokeNoArgs(workspace, "getPageIndicator");
+            if (indicator == null) indicator = fieldValue(workspace, "mPageIndicator");
+            if (indicator instanceof View) return (View) indicator;
+        }
+        Object launcher = findLauncher(start, workspace);
+        Object ws = invokeNoArgs(launcher, "getWorkspace");
+        if (ws != null && ws != workspace) {
+            Object indicator = invokeNoArgs(ws, "getPageIndicator");
+            if (indicator == null) indicator = fieldValue(ws, "mPageIndicator");
+            if (indicator instanceof View) return (View) indicator;
+        }
+        ViewParent parent = workspace != null ? workspace.getParent()
+                : (start != null ? start.getParent() : null);
+        if (parent instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) parent;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child == null) continue;
+                String name = child.getClass().getName();
+                if (name != null && name.contains("PageIndicator")) return child;
+            }
+        }
+        return null;
+    }
+
+    private static Object findLauncher(View start, View workspace) {
+        Object launcher = null;
+        if (workspace != null) {
+            launcher = invokeNoArgs(workspace, "getLauncher");
+            if (launcher == null) launcher = fieldValue(workspace, "mLauncher");
+            if (launcher == null) launcher = fieldValue(workspace, "mActivity");
+        }
+        if (launcher == null && start != null) {
+            for (View current = start; current != null; ) {
+                Object got = invokeNoArgs(current, "getLauncher");
+                if (got == null) got = fieldValue(current, "mLauncher");
+                if (got == null) got = fieldValue(current, "mActivity");
+                if (got != null) return got;
+                String name = current.getClass().getSimpleName();
+                if (name != null && name.contains("Launcher") && !name.contains("AppWidget")) {
+                    return current;
+                }
+                ViewParent parent = current.getParent();
+                if (!(parent instanceof View)) break;
+                current = (View) parent;
+            }
+        }
+        return launcher;
     }
 
     private static View findWorkspaceAncestor(View start) {

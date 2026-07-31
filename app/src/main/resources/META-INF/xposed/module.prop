@@ -1,7 +1,7 @@
 name=ColorOS LiquidGlass
 description=ColorOS 16 Launcher folder LiquidGlass
-version=0.3.0
-versionCode=6
+version=0.3.2
+versionCode=8
 author=z841973620
 minApiVersion=101
 targetApiVersion=101

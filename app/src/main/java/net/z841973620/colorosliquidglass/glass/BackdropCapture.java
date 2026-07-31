@@ -6,7 +6,6 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
-import android.os.SystemClock;
 import android.view.View;
 import android.view.ViewParent;
 import android.view.ViewTreeObserver;
@@ -17,27 +16,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 
-/**
- * Captures a target-local backdrop for one Launcher folder background.
- * Large folders are expensive to sample, so capture is dirty-driven, downscaled, and
- * never re-entered from the invalidate that publishes a new frame.
- * <p>
- * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
- * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
- * software-draw the hierarchy.
- */
-final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
-        View.OnAttachStateChangeListener {
+    /**
+     * Captures a target-local backdrop for one Launcher folder background.
+     * Capture bitmaps stay 1:1 with the glass view so backdrop detail matches screen pixels.
+     * Sampling runs every frame while the glass is moving (geometry / drag / wallpaper zoom);
+     * while stationary the last good frame is kept (no idle re-sample).
+     * <p>
+     * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
+     * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
+     * software-draw the hierarchy.
+     */
+    final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
+            View.OnAttachStateChangeListener {
     private static final Map<View, BackdropCapture> CAPTURES = new WeakHashMap<>();
     private static final Map<View, WeakReference<View>> OVERLAY_SOURCES = new WeakHashMap<>();
-    /** While moving/resizing, refresh as often as predraw allows (1ms pacing). */
-    private static final long ACTIVE_CAPTURE_INTERVAL_MS = 1L;
-    /** Idle desktop folders barely change; avoid full-hierarchy redraws every frame. */
-    private static final long IDLE_CAPTURE_INTERVAL_MS = 1000L;
-    /** Keep active pacing until folder/wallpaper has been still for this long. */
-    private static final long IDLE_SETTLE_MS = 1000L;
-    /** Cap software bitmap edge so 2x2 folders do not allocate huge ARGB buffers. */
-    private static final int MAX_CAPTURE_EDGE_PX = 320;
 
     static BackdropCapture register(View target) {
         synchronized (CAPTURES) {
@@ -116,19 +108,16 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             capture.rootRef = new WeakReference<>(root);
         }
         if (capture.recording) return;
-        capture.activeUntil = SystemClock.uptimeMillis() + IDLE_SETTLE_MS;
         capture.dirty = true;
         capture.capture(root, target, true);
-        capture.lastCapture = SystemClock.uptimeMillis();
     }
 
     /**
-     * Marks every live capture dirty and keeps active pacing briefly. Used after unlock /
-     * resume when wallpaper and DragLayer alpha settle asynchronously.
+     * Marks every live capture dirty. Used after unlock / resume when wallpaper and
+     * DragLayer alpha settle asynchronously.
      * Keeps the last good frame until a meaningful replacement arrives (no fallback flash).
      */
     static void refreshAll() {
-        long now = SystemClock.uptimeMillis();
         List<View> targets = new ArrayList<>();
         synchronized (CAPTURES) {
             for (Map.Entry<View, BackdropCapture> entry : CAPTURES.entrySet()) {
@@ -136,7 +125,6 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
                 BackdropCapture capture = entry.getValue();
                 if (capture == null) continue;
                 capture.dirty = true;
-                capture.activeUntil = Math.max(capture.activeUntil, now + 2000L);
                 // Force geometry re-evaluation so depth/alpha changes are not missed.
                 capture.lastWallpaperDepth = Float.NaN;
                 capture.lastRootScale = Float.NaN;
@@ -160,8 +148,6 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
     private final int[] locationScratch = new int[2];
     private final Rect visibleScratch = new Rect();
     private boolean validFrame;
-    private long lastCapture;
-    private long activeUntil;
     private boolean recording;
     private boolean observerAttached;
     /** Set after publishing a frame so the resulting invalidate does not recapture immediately. */
@@ -215,7 +201,6 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
 
     private void markDirty() {
         dirty = true;
-        activeUntil = Math.max(activeUntil, SystemClock.uptimeMillis() + IDLE_SETTLE_MS);
     }
 
     @Override public boolean onPreDraw() {
@@ -231,10 +216,7 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         }
 
         boolean geometryChanged = updateGeometryState(target, owner, root);
-        if (geometryChanged) {
-            dirty = true;
-            activeUntil = SystemClock.uptimeMillis() + IDLE_SETTLE_MS;
-        }
+        if (geometryChanged) dirty = true;
 
         // Lock / early unlock: DragLayer alpha is 0. Skip sampling so we do not overwrite a
         // good snapshot with an empty frame; stay dirty until the hierarchy is visible again.
@@ -250,16 +232,17 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             if (!geometryChanged && !dirty) return true;
         }
 
-        long now = SystemClock.uptimeMillis();
         boolean wallpaperAnimating = WallpaperScaleTracker.isAnimating();
-        boolean active = now <= activeUntil || geometryChanged || wallpaperAnimating;
-        long interval = active ? ACTIVE_CAPTURE_INTERVAL_MS : IDLE_CAPTURE_INTERVAL_MS;
-        // Spread idle refreshes so many large folders do not all redraw the hierarchy together.
-        if (!active) interval += Math.floorMod(System.identityHashCode(this), 45);
-        if (validFrame && !dirty && !geometryChanged && now - lastCapture < interval) return true;
+        boolean underDrag = dragViewAncestor(target) != null;
+        boolean moving = geometryChanged || underDrag || wallpaperAnimating;
+
+        // Stationary: keep the last good frame (no idle re-sample). Still allow a one-shot
+        // when there is no frame yet, or dirty was set by unlock / install / forceCapture.
+        if (!moving) {
+            if (validFrame && !dirty) return true;
+        }
 
         capture(root, target, false);
-        lastCapture = now;
         dirty = false;
         return true;
     }
@@ -509,10 +492,9 @@ final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
         }
     }
 
+    /** Always capture at view pixel size — downscaling made the glass backdrop look soft. */
     private static float captureScale(int width, int height) {
-        int edge = Math.max(width, height);
-        if (edge <= MAX_CAPTURE_EDGE_PX) return 1f;
-        return MAX_CAPTURE_EDGE_PX / (float) edge;
+        return 1f;
     }
 
     private static void translateRootToTarget(View root, View target, Canvas canvas) {

@@ -18,15 +18,16 @@ import java.util.Map;
 import java.util.WeakHashMap;
 
     /**
-     * Captures a target-local backdrop for one Launcher folder background.
-     * Capture bitmaps stay 1:1 with the glass view so backdrop detail matches screen pixels.
-     * Sampling runs every frame while the glass is moving (geometry / drag / wallpaper zoom);
-     * while stationary the last good frame is kept (no idle re-sample).
-     * <p>
-     * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
-     * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
-     * software-draw the hierarchy.
-     */
+ * Captures a target-local backdrop for one Launcher folder background.
+ * Capture bitmaps stay 1:1 with the glass view so backdrop detail matches screen pixels.
+ * Sampling runs every frame while the glass is moving (geometry / drag / wallpaper zoom);
+ * while stationary the last good frame is kept (no idle re-sample).
+ * <p>
+ * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
+ * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
+ * software-draw the hierarchy. Task-menu glass uses wallpaper + HW-rasterized thumbnails
+ * (no {@code root.draw}). RapidReaction capsules sample wallpaper only.
+ */
     final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             View.OnAttachStateChangeListener {
     private static final Map<View, BackdropCapture> CAPTURES = new WeakHashMap<>();
@@ -449,6 +450,8 @@ import java.util.WeakHashMap;
             canvas.scale(scale, scale);
             translateRootToTarget(root, target, canvas);
             drawWallpaper(root, canvas);
+            View overlaySeed = overlaySourceOf(target);
+            boolean taskGlass = TaskContentOverlay.isTaskView(overlaySeed);
             if (dragGlass) {
                 // Never hide *DragView during drag capture — that flickers the preview.
                 canvas.restore();
@@ -458,6 +461,21 @@ import java.util.WeakHashMap;
                     DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
                 } catch (Throwable ignored) {
                 }
+                canvas.restore();
+            } else if (taskGlass) {
+                // Wallpaper already sampled in root→target space above.
+                // Task thumbnail uses glass-local matrices — reset, then blit (no root.draw).
+                canvas.restore();
+                canvas.save();
+                canvas.scale(scale, scale);
+                try {
+                    TaskContentOverlay.paintIntoTargetLocal(target, canvas);
+                } catch (Throwable ignored) {
+                }
+                canvas.restore();
+            } else if (isWallpaperOnlyGlass(target)) {
+                // RapidReaction capsules sit under the live app: desktop/wallpaper only.
+                // Never software-draw the launcher tree (severe frame drops).
                 canvas.restore();
             } else {
                 View dragView = dragViewAncestor(target);
@@ -475,7 +493,8 @@ import java.util.WeakHashMap;
             boolean seedChanged = dragGlass && seedGen != publishedDragSeedGeneration;
             complete = isMeaningful(backBitmap)
                     || (forced && !validFrame)
-                    || (dragGlass && (forced || seedChanged));
+                    || (dragGlass && (forced || seedChanged))
+                    || (taskGlass && forced);
         } catch (Throwable ignored) {
             // Keep the previous useful frame.
         } finally {
@@ -646,6 +665,12 @@ import java.util.WeakHashMap;
     private static View rootOf(View target) {
         View root = target.getRootView();
         return root == null ? target : root;
+    }
+
+    /** RapidReaction glass hosts are tagged {@code colg_rapid_*} and sample wallpaper only. */
+    private static boolean isWallpaperOnlyGlass(View target) {
+        Object tag = target == null ? null : target.getTag();
+        return tag instanceof String && ((String) tag).startsWith("colg_rapid_");
     }
 
     private void attach(View root) {

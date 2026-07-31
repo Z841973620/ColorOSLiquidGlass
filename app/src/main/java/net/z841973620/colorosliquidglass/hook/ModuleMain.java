@@ -76,6 +76,7 @@ public final class ModuleMain extends XposedModule {
         hookFolderDragPreview(cl);
         hookFolderDragDepthBlur(cl);
         hookRecentsClearButton(cl);
+        hookRecentsTaskShortcuts(cl);
         hookToggleBarChrome(cl);
         hookDragViewMove(cl);
         hookWorkspaceDragOver(cl);
@@ -730,6 +731,523 @@ public final class ModuleMain extends XposedModule {
             }
         } catch (Throwable e) {
             log(5, TAG, "PressFeedbackButton clear-glass hooks unavailable", e);
+        }
+    }
+
+    /**
+     * Recents "分屏" / "浮窗" chrome — two different surfaces:
+     * <ol>
+     *   <li>RapidReaction ({@code MultiTriggerPanelView}): capsules shown only while
+     *       gesture-swiping up from an app into Overview.</li>
+     *   <li>{@code OplusTaskMenuViewImpl}: ··· app-options popup (also lists 分屏/浮窗).</li>
+     * </ol>
+     * Phone header ImageButtons stay GONE without large-display features; still glass
+     * them when VISIBLE on tablet / fold.
+     */
+    private void hookRecentsTaskShortcuts(ClassLoader cl) {
+        hookRecentsRapidReactionGlass(cl);
+        after("com.android.quickstep.views.OplusTaskMenuViewImpl", cl, "addMenuOptions",
+                this::applyTaskMenuGlass);
+        after("com.android.quickstep.views.OplusTaskMenuViewImpl", cl, "animateOpen",
+                this::applyTaskMenuGlass);
+        try {
+            Class<?> menu = Class.forName(
+                    "com.android.quickstep.views.OplusTaskMenuViewImpl", false, cl);
+            for (Method m : menu.getDeclaredMethods()) {
+                String name = m.getName();
+                if (m.isBridge() || m.isSynthetic()) continue;
+                if (!(name.equals("populateAndShowForTask") || name.equals("animateOpenOrClosed"))) {
+                    continue;
+                }
+                final String hooked = name;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (!enabled()) return result;
+                        if (hooked.equals("animateOpenOrClosed")
+                                && Boolean.TRUE.equals(chain.getArg(0))) {
+                            return result;
+                        }
+                        applyTaskMenuGlass(chain.getThisObject());
+                    } catch (Throwable e) {
+                        log(5, TAG, "OplusTaskMenuViewImpl." + hooked + " glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "OplusTaskMenuViewImpl glass hooks unavailable", e);
+        }
+
+        after("com.oplus.quickstep.views.OplusTaskHeaderView", cl, "onFinishInflate",
+                this::applyTaskHeaderShortcutGlass);
+        try {
+            Class<?> header = Class.forName(
+                    "com.oplus.quickstep.views.OplusTaskHeaderView", false, cl);
+            for (Method m : header.getDeclaredMethods()) {
+                if (!m.getName().equals("showWindowIcon") || m.isBridge() || m.isSynthetic()) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (!enabled()) return result;
+                        Object arg0 = chain.getArg(0);
+                        if (arg0 instanceof View) {
+                            applyTaskHeaderShortcutButtonGlass((View) arg0);
+                        }
+                        applyTaskHeaderShortcutGlass(chain.getThisObject());
+                    } catch (Throwable e) {
+                        log(5, TAG, "OplusTaskHeaderView.showWindowIcon glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "OplusTaskHeaderView shortcut glass hooks unavailable", e);
+        }
+    }
+
+    /**
+     * From-app swipe RapidReaction capsules (分屏 / 浮窗). OEM paints opaque rounded rects
+     * in {@code MultiRectangleBackgroundView}; replace those fills with LiquidGlass hosts
+     * sized to each {@code RectPaint} and keep icon/title content above.
+     */
+    private void hookRecentsRapidReactionGlass(ClassLoader cl) {
+        after("com.oplus.quickstep.rapidreaction.widget.MultiTriggerPanelView", cl,
+                "updateViewVisibility", this::applyRapidReactionGlass);
+        after("com.oplus.quickstep.rapidreaction.widget.MultiTriggerPanelView", cl,
+                "onLayout", this::applyRapidReactionGlass);
+        try {
+            Class<?> panel = Class.forName(
+                    "com.oplus.quickstep.rapidreaction.widget.MultiTriggerPanelView", false, cl);
+            for (Method m : panel.getDeclaredMethods()) {
+                String name = m.getName();
+                if (m.isBridge() || m.isSynthetic()) continue;
+                if (!(name.equals("updateAppSupportState")
+                        || name.equals("updateProgress")
+                        || name.equals("initAnimation")
+                        || name.equals("setVisibility"))) {
+                    continue;
+                }
+                final String hooked = name;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (enabled()) applyRapidReactionGlass(chain.getThisObject());
+                    } catch (Throwable e) {
+                        log(5, TAG, "MultiTriggerPanelView." + hooked + " glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "MultiTriggerPanelView glass hooks unavailable", e);
+        }
+        try {
+            Class<?> bg = Class.forName(
+                    "com.oplus.quickstep.rapidreaction.widget.MultiRectangleBackgroundView",
+                    false, cl);
+            for (Method m : bg.getDeclaredMethods()) {
+                if (!m.getName().equals("onDraw") || m.getParameterCount() != 1
+                        || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    try {
+                        if (enabled()) clearRapidReactionOpaqueFills(chain.getThisObject());
+                    } catch (Throwable ignored) { }
+                    return chain.proceed();
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "MultiRectangleBackgroundView.onDraw glass hook unavailable", e);
+        }
+    }
+
+    private void applyRapidReactionGlass(Object panel) {
+        if (!enabled() || !(panel instanceof ViewGroup)) return;
+        final ViewGroup host = (ViewGroup) panel;
+        if (host.getVisibility() != View.VISIBLE) return;
+        try {
+            Object bg = field(panel, "hintDoubleRectBackgroundView");
+            if (!(bg instanceof View)) return;
+            Object paints = field(bg, "mBgRectPaints");
+            if (!(paints instanceof Iterable<?>)) return;
+            float radius = readRapidReactionRadius((View) bg);
+            clearRapidReactionOpaqueFills(bg);
+            for (Object rectPaint : (Iterable<?>) paints) {
+                if (rectPaint == null) continue;
+                Object linked = invokeNoArgs(rectPaint, "getMLinkedEntranceType");
+                if (!isRapidSplitOrFloat(linked)) continue;
+                android.graphics.RectF rect = rapidPaintDrawRect(rectPaint);
+                if (rect == null || rect.width() < 2f || rect.height() < 2f) continue;
+                // RectPaint coords are local to MultiRectangleBackgroundView.
+                rect.offset(((View) bg).getLeft(), ((View) bg).getTop());
+                String typeKey = String.valueOf(linked);
+                View glassHost = findOrCreateRapidGlassHost(host, (View) bg, typeKey);
+                int prevW = glassHost.getWidth();
+                int prevH = glassHost.getHeight();
+                layoutRapidGlassHost(glassHost, rect);
+                // Capsules sit under the live app surface — sample desktop/wallpaper only.
+                // Never attach TaskView overlay (that regression was introduced in 0778e1c).
+                GlassInstaller.setOverlaySource(glassHost, null);
+                boolean firstInstall = GlassInstaller.get(glassHost) == null;
+                GlassInstaller.installBackground(glassHost, currentConfig());
+                GlassDrawable live = GlassInstaller.get(glassHost);
+                if (live != null && radius > 0f) {
+                    live.setCornerRadii(radius, radius, radius, radius);
+                }
+                boolean sizeChanged = glassHost.getWidth() != prevW || glassHost.getHeight() != prevH;
+                // Avoid forceCapture on every gesture progress tick — onPreDraw handles motion.
+                if (firstInstall || sizeChanged) {
+                    GlassInstaller.forceCapture(glassHost);
+                }
+                glassHost.invalidate();
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "applyRapidReactionGlass failed", e);
+        }
+    }
+
+    private static boolean isRapidSplitOrFloat(Object selectionOptions) {
+        if (selectionOptions == null) return false;
+        String name = selectionOptions.toString();
+        return name.contains("SPLIT_WINDOW") || name.contains("FLOATING_WINDOW");
+    }
+
+    private static void clearRapidReactionOpaqueFills(Object bgView) {
+        Object paints = field(bgView, "mBgRectPaints");
+        if (!(paints instanceof Iterable<?>)) return;
+        for (Object rectPaint : (Iterable<?>) paints) {
+            if (rectPaint == null) continue;
+            Object linked = invokeNoArgs(rectPaint, "getMLinkedEntranceType");
+            if (!isRapidSplitOrFloat(linked)) continue;
+            Object paint = invokeNoArgs(rectPaint, "getMPaint");
+            if (paint instanceof android.graphics.Paint) {
+                ((android.graphics.Paint) paint).setColor(0);
+            }
+        }
+    }
+
+    private static android.graphics.RectF rapidPaintDrawRect(Object rectPaint) {
+        Object draw = field(rectPaint, "mDrawRect");
+        if (draw instanceof android.graphics.RectF) {
+            android.graphics.RectF r = (android.graphics.RectF) draw;
+            if (r.width() > 1f && r.height() > 1f) return new android.graphics.RectF(r);
+        }
+        Object base = invokeNoArgs(rectPaint, "getMBaseRect");
+        if (!(base instanceof android.graphics.RectF)) base = field(rectPaint, "mBaseRect");
+        if (!(base instanceof android.graphics.RectF)) return null;
+        android.graphics.RectF rect = new android.graphics.RectF((android.graphics.RectF) base);
+        Object tx = invokeNoArgs(rectPaint, "getMTranslationX");
+        Object ty = invokeNoArgs(rectPaint, "getMTranslationY");
+        float ox = tx instanceof Number ? ((Number) tx).floatValue() : 0f;
+        float oy = ty instanceof Number ? ((Number) ty).floatValue() : 0f;
+        rect.offset(ox, oy);
+        Object sx = invokeNoArgs(rectPaint, "getMScaleX");
+        Object sy = invokeNoArgs(rectPaint, "getMScaleY");
+        float scaleX = sx instanceof Number ? ((Number) sx).floatValue() : 1f;
+        float scaleY = sy instanceof Number ? ((Number) sy).floatValue() : 1f;
+        if (Math.abs(scaleX - 1f) > 0.001f || Math.abs(scaleY - 1f) > 0.001f) {
+            float cx = rect.centerX();
+            float cy = rect.centerY();
+            float w = rect.width() * scaleX;
+            float h = rect.height() * scaleY;
+            rect.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f);
+        }
+        return rect;
+    }
+
+    private static final String RAPID_GLASS_TAG_PREFIX = "colg_rapid_";
+
+    private static View findOrCreateRapidGlassHost(ViewGroup panel, View bgView, String typeKey) {
+        String tag = RAPID_GLASS_TAG_PREFIX + typeKey;
+        for (int i = 0; i < panel.getChildCount(); i++) {
+            View child = panel.getChildAt(i);
+            if (child != null && tag.equals(child.getTag())) return child;
+        }
+        android.widget.FrameLayout host = new android.widget.FrameLayout(panel.getContext());
+        host.setTag(tag);
+        host.setClickable(false);
+        host.setFocusable(false);
+        host.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        int index = panel.indexOfChild(bgView);
+        if (index >= 0) panel.addView(host, index + 1);
+        else panel.addView(host, 0);
+        return host;
+    }
+
+    private static void layoutRapidGlassHost(View host, android.graphics.RectF rect) {
+        int left = Math.round(rect.left);
+        int top = Math.round(rect.top);
+        int right = Math.round(rect.right);
+        int bottom = Math.round(rect.bottom);
+        int width = Math.max(1, right - left);
+        int height = Math.max(1, bottom - top);
+        ViewGroup.LayoutParams lp = host.getLayoutParams();
+        if (lp == null) {
+            host.setLayoutParams(new ViewGroup.LayoutParams(width, height));
+        } else {
+            lp.width = width;
+            lp.height = height;
+            host.setLayoutParams(lp);
+        }
+        host.layout(left, top, left + width, top + height);
+        host.setVisibility(View.VISIBLE);
+    }
+
+    private static float readRapidReactionRadius(View view) {
+        try {
+            int id = view.getResources().getIdentifier(
+                    "rapid_reaction_double_rect_background_smooth_corner_radius",
+                    "dimen", view.getContext().getPackageName());
+            if (id != 0) return view.getResources().getDimension(id);
+        } catch (Throwable ignored) { }
+        return 9f * view.getResources().getDisplayMetrics().density;
+    }
+
+    private View findRunningTaskViewForOverlay(Object panelOrMenu) {
+        try {
+            Object swipeRef = field(panelOrMenu, "swipeUpHandlerRef");
+            Object swipe = swipeRef instanceof java.lang.ref.WeakReference
+                    ? ((java.lang.ref.WeakReference<?>) swipeRef).get()
+                    : null;
+            Object recents = swipe != null ? field(swipe, "mRecentsView") : null;
+            if (recents == null) recents = invokeNoArgs(swipe, "getRecentsView");
+            if (recents == null) {
+                Object launcher = findActiveLauncher();
+                recents = invokeNoArgs(launcher, "getOverviewPanel");
+            }
+            Object running = invokeNoArgs(recents, "getRunningTaskView");
+            if (running instanceof View) return (View) running;
+            Object current = invokeNoArgs(recents, "getCurrentPageTaskView");
+            if (current instanceof View) return (View) current;
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    /** LiquidGlass behind the Recents ··· popup that also lists 分屏 / 浮窗. */
+    private void applyTaskMenuGlass(Object menu) {
+        if (!enabled() || !(menu instanceof View)) return;
+        final View host = (View) menu;
+        try {
+            Object listObj = field(menu, "mListView");
+            final View listView = listObj instanceof View ? (View) listObj : null;
+            clearTaskMenuOpaqueChrome(menu, listView);
+
+            // Glass must stay on the HW-accelerated menu wrapper. ListView backgrounds are
+            // often drawn without AGSL-capable acceleration, which drops the liquid look.
+            if (listView != null && GlassInstaller.get(listView) != null) {
+                GlassInstaller.uninstall(listView);
+            }
+            GlassInstaller.installBackground(host, currentConfig());
+            View taskView = resolveTaskMenuTaskView(menu);
+            if (taskView != null) {
+                GlassInstaller.setOverlaySource(host, taskView);
+            }
+            final View taskOverlay = taskView;
+            Runnable refresh = () -> {
+                clearTaskMenuOpaqueChrome(menu, listView);
+                // Reassert glass if OEM chrome wipe raced us — never leave a null background.
+                if (GlassInstaller.get(host) == null
+                        || !(host.getBackground() instanceof GlassDrawable)) {
+                    GlassInstaller.installBackground(host, currentConfig());
+                }
+                GlassDrawable live = GlassInstaller.get(host);
+                if (live == null) return;
+                float radius = readTaskMenuRadius(host);
+                if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
+                if (host.getWidth() <= 0 || host.getHeight() <= 0) return;
+                if (taskOverlay != null) {
+                    GlassInstaller.setOverlaySource(host, taskOverlay);
+                }
+                GlassInstaller.forceCapture(host);
+                host.invalidate();
+                log(4, TAG, "TaskMenu glass ready size="
+                        + host.getWidth() + "x" + host.getHeight()
+                        + " radius=" + radius
+                        + " taskOverlay=" + (taskOverlay != null));
+            };
+            if (host.getWidth() > 0 && host.getHeight() > 0) {
+                refresh.run();
+                host.post(refresh);
+                host.postDelayed(refresh, 160L);
+            } else {
+                host.post(refresh);
+                host.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                    @Override
+                    public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                            int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                        if (v.getWidth() > 0 && v.getHeight() > 0) {
+                            v.removeOnLayoutChangeListener(this);
+                            refresh.run();
+                            v.postDelayed(refresh, 160L);
+                        }
+                    }
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "applyTaskMenuGlass failed", e);
+        }
+    }
+
+    private View resolveTaskMenuTaskView(Object menu) {
+        Object taskView = field(menu, "mTaskView");
+        if (taskView instanceof View) return (View) taskView;
+        Object via = invokeNoArgs(menu, "getTaskView");
+        if (via instanceof View) return (View) via;
+        Object container = field(menu, "mTaskContainer");
+        Object fromContainer = invokeNoArgs(container, "getTaskView");
+        return fromContainer instanceof View ? (View) fromContainer : null;
+    }
+
+    /**
+     * Strip opaque OEM chrome that sits above LiquidGlass: ListView popup drawable,
+     * RoundFrameLayout white fill, and the #ebebeb group divider between 分屏 and 锁定.
+     * Never clears a {@link GlassDrawable} background.
+     */
+    private void clearTaskMenuOpaqueChrome(Object menu, View listView) {
+        if (listView != null) {
+            if (!(listView.getBackground() instanceof GlassDrawable)) {
+                listView.setBackground(null);
+            }
+            Object parent = listView.getParent();
+            if (parent instanceof View) {
+                View roundFrame = (View) parent;
+                if (!(roundFrame.getBackground() instanceof GlassDrawable)) {
+                    roundFrame.setBackground(null);
+                }
+                try {
+                    invoke(roundFrame, "setClipMode", new Class<?>[] { int.class }, 0);
+                } catch (Throwable ignored) { }
+                if (!(roundFrame.getBackground() instanceof GlassDrawable)) {
+                    roundFrame.setBackground(null);
+                }
+            }
+            if (listView instanceof ViewGroup) {
+                ViewGroup group = (ViewGroup) listView;
+                clearTaskMenuDividerFills(group);
+                if (group.getTag() != TAG_TASK_MENU_HIERARCHY) {
+                    group.setTag(TAG_TASK_MENU_HIERARCHY);
+                    group.setOnHierarchyChangeListener(new ViewGroup.OnHierarchyChangeListener() {
+                        @Override
+                        public void onChildViewAdded(View parent, View child) {
+                            clearTaskMenuDividerFillsIn(child);
+                        }
+
+                        @Override
+                        public void onChildViewRemoved(View parent, View child) { }
+                    });
+                }
+            }
+        }
+    }
+
+    private static final Object TAG_TASK_MENU_HIERARCHY = new Object();
+
+    private static void clearTaskMenuDividerFills(ViewGroup listView) {
+        for (int i = 0; i < listView.getChildCount(); i++) {
+            clearTaskMenuDividerFillsIn(listView.getChildAt(i));
+        }
+    }
+
+    private static void clearTaskMenuDividerFillsIn(View row) {
+        if (row == null) return;
+        View groupDivider = findDescendantByIdName(row, "menu_divider");
+        if (groupDivider != null) {
+            groupDivider.setBackground(null);
+            if (groupDivider instanceof ImageView) {
+                ((ImageView) groupDivider).setImageDrawable(null);
+            }
+            groupDivider.setVisibility(View.INVISIBLE);
+        }
+        View itemDivider = findDescendantByIdName(row, "divider");
+        if (itemDivider != null) {
+            itemDivider.setBackground(null);
+            if (itemDivider instanceof ImageView) {
+                ((ImageView) itemDivider).setImageDrawable(null);
+            }
+        }
+    }
+
+    private static View findDescendantByIdName(View root, String idName) {
+        if (root == null || idName == null) return null;
+        try {
+            int id = root.getResources().getIdentifier(
+                    idName, "id", root.getContext().getPackageName());
+            if (id != 0) {
+                View found = root.findViewById(id);
+                if (found != null) return found;
+            }
+        } catch (Throwable ignored) { }
+        if (!(root instanceof ViewGroup)) return null;
+        ViewGroup group = (ViewGroup) root;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View found = findDescendantByIdName(group.getChildAt(i), idName);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static float readTaskMenuRadius(View view) {
+        try {
+            int id = view.getResources().getIdentifier(
+                    "coui_round_corner_m", "dimen", view.getContext().getPackageName());
+            if (id != 0) return view.getResources().getDimension(id);
+        } catch (Throwable ignored) { }
+        return 12f * view.getResources().getDisplayMetrics().density;
+    }
+
+    private void applyTaskHeaderShortcutGlass(Object header) {
+        if (!enabled() || header == null) return;
+        applyTaskHeaderShortcutButtonGlass(field(header, "splitWindowBtn"));
+        applyTaskHeaderShortcutButtonGlass(invokeNoArgs(header, "getSplitWindowBtn"));
+        applyTaskHeaderShortcutButtonGlass(field(header, "miniWindowBtn"));
+        applyTaskHeaderShortcutButtonGlass(invokeNoArgs(header, "getMiniWindowBtn"));
+    }
+
+    /**
+     * Large-display header 分屏 / 浮窗 ImageButtons. Skip GONE hosts — phones keep them
+     * invisible forever behind {@code hasLargeDisplayFeatures()}.
+     */
+    private void applyTaskHeaderShortcutButtonGlass(Object buttonObj) {
+        if (!enabled() || !(buttonObj instanceof ImageView)) return;
+        final View button = (View) buttonObj;
+        if (button.getVisibility() != View.VISIBLE) return;
+        try {
+            GlassInstaller.installBackground(button, currentConfig());
+            Runnable refresh = () -> {
+                if (button.getVisibility() != View.VISIBLE) return;
+                GlassDrawable live = GlassInstaller.get(button);
+                if (live == null) return;
+                float radius = Math.min(button.getWidth(), button.getHeight()) / 2f;
+                if (radius <= 0f) {
+                    radius = 14f * button.getResources().getDisplayMetrics().density;
+                }
+                live.setCornerRadii(radius, radius, radius, radius);
+                if (button.getWidth() <= 0 || button.getHeight() <= 0) return;
+                GlassInstaller.forceCapture(button);
+                button.invalidate();
+                log(4, TAG, "TaskHeader shortcut glass ready "
+                        + button.getClass().getSimpleName()
+                        + " size=" + button.getWidth() + "x" + button.getHeight());
+            };
+            if (button.getWidth() > 0 && button.getHeight() > 0) refresh.run();
+            else {
+                button.post(refresh);
+                button.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                    @Override
+                    public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                            int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                        if (v.getVisibility() == View.VISIBLE
+                                && v.getWidth() > 0 && v.getHeight() > 0) {
+                            v.removeOnLayoutChangeListener(this);
+                            refresh.run();
+                        }
+                    }
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "applyTaskHeaderShortcutButtonGlass failed", e);
         }
     }
 

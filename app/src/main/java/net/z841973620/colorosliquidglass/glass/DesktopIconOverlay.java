@@ -58,18 +58,21 @@ final class DesktopIconOverlay {
      * After finger-up the FolderIcon may keep a leftover overlay seed while no longer
      * under a DragView; painting then would secondary-refract the desktop into the
      * folder's own plate. Require a live *DragView ancestor (OEM: OplusDragView etc.).
+     * <p>
+     * Page-indicator dots live in the horizontal strip between Workspace and Hotseat.
+     * A folder sitting entirely on that strip intersects neither icon container — still
+     * paint the dots (do not early-return when containers are empty).
      */
     static void paintIntoTargetLocal(View glassHost, Canvas canvas) {
         if (glassHost == null || canvas == null) return;
         if (findDragView(glassHost) == null) return;
         View seed = BackdropCapture.overlaySourceOf(glassHost);
-        List<ViewGroup> containers = iconContainersUnderGlass(seed, glassHost);
-        if (containers.isEmpty()) return;
         Matrix targetToGlobal = new Matrix();
         glassHost.transformMatrixToGlobal(targetToGlobal);
         Matrix globalToTarget = new Matrix();
         if (!targetToGlobal.invert(globalToTarget)) return;
 
+        List<ViewGroup> containers = iconContainersUnderGlass(seed, glassHost);
         for (ViewGroup icons : containers) {
             for (int i = 0; i < icons.getChildCount(); i++) {
                 View child = icons.getChildAt(i);
@@ -179,22 +182,35 @@ final class DesktopIconOverlay {
 
     /**
      * Rasterize a non-icon desktop chrome View (page indicator dots) into the sample.
-     * Same offscreen draw approach as widgets — no window PixelCopy / DragView hide.
+     * Prefer software draw. Skip {@link #isMostlyEmpty}: padded wrap_content + few dots
+     * is mostly transparent by design. Hide nested {@code mBlurBgView} LiquidGlass.
      */
     private static void paintDesktopChrome(View host, Canvas canvas, Matrix globalToTarget) {
         if (host == null) return;
         int w = host.getWidth();
         int h = host.getHeight();
         if (w <= 0 || h <= 0) return;
-        Bitmap rendered = GlassHwRasterizer.render(w, h, host::draw);
-        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
-            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+
+        View blurBg = null;
+        float prevBlurAlpha = 1f;
+        Object blurObj = fieldValue(host, "mBlurBgView");
+        if (blurObj instanceof View) {
+            blurBg = (View) blurObj;
+            prevBlurAlpha = blurBg.getAlpha();
+            blurBg.setAlpha(0f);
+        }
+
+        Bitmap rendered = null;
+        try {
             rendered = rasterizeViewSoftware(host, w, h);
+            if (rendered == null || rendered.isRecycled()) {
+                if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+                rendered = GlassHwRasterizer.render(w, h, host::draw);
+            }
+        } finally {
+            if (blurBg != null) blurBg.setAlpha(prevBlurAlpha);
         }
-        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
-            if (rendered != null && !rendered.isRecycled()) rendered.recycle();
-            return;
-        }
+        if (rendered == null || rendered.isRecycled()) return;
         try {
             RectF dest = mapItemRectToTarget(host,
                     new Rect(0, 0, rendered.getWidth(), rendered.getHeight()), globalToTarget);

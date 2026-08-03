@@ -63,6 +63,8 @@ public final class ModuleMain extends XposedModule {
     /** Delayed float-menu glass applies — cancelled on dismiss so they cannot reopen ashmem. */
     private final java.util.ArrayList<Runnable> pendingFloatMenuGlass = new java.util.ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /** ColorOS 13/14 backend; null when using the built-in ColorOS 15+ Hook path. */
+    private Os14HookBackend legacyBackend;
     @Override public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         String pkg = param.getPackageName();
         if (!pkg.equals("com.android.launcher") && !pkg.equals("com.android.systemui")) return;
@@ -79,6 +81,20 @@ public final class ModuleMain extends XposedModule {
         // Do not return for !isFirstPackage or enabled=false. ColorOS may expose the useful
         // ClassLoader in a later callback, and hooks must already exist when the next config is read.
         ClassLoader cl = param.getDefaultClassLoader();
+        ColorOsVersion.Flavor flavor = ColorOsVersion.detect(cl);
+        boolean useLegacy = ColorOsVersion.usesLegacyLauncherApis(cl);
+        log(4, TAG, "ColorOS flavor=" + flavor
+                + " major=" + ColorOsVersion.majorVersion()
+                + " useLegacyApis=" + useLegacy);
+        if (useLegacy) {
+            if (legacyBackend == null) legacyBackend = new Os14HookBackend();
+            if (pkg.equals("com.android.launcher")) {
+                legacyBackend.hookLauncher(this, cl, remotePreferences);
+            } else {
+                legacyBackend.hookSystemUi(this, cl, remotePreferences);
+            }
+            return;
+        }
         if (pkg.equals("com.android.launcher")) {
             hookLauncher(cl);
         } else {

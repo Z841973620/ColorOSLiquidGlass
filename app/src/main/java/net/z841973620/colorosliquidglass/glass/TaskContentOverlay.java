@@ -63,17 +63,24 @@ public final class TaskContentOverlay {
         Matrix globalToTarget = new Matrix();
         globalToTarget.setTranslate(-screenRect.left, -screenRect.top);
         RectF region = new RectF(screenRect);
+        View root = seed != null && seed.getRootView() != null ? seed.getRootView() : seed;
         View recents = findRecentsView(seed);
         if (recents == null) {
-            View root = seed != null && seed.getRootView() != null ? seed.getRootView() : seed;
             recents = findRecentsInTree(root);
         }
-        if (recents == null) return;
-
-        int painted = paintTaskViewsInto(recents, canvas, globalToTarget, region);
-        if (painted <= 0) {
-            // ColorOS may nest thumbnails outside *TaskView* naming — rasterize the panel.
-            paintPanelIntoRegion(recents, canvas, globalToTarget, region);
+        if (recents != null) {
+            int painted = paintTaskViewsInto(recents, canvas, globalToTarget, region);
+            if (painted <= 0) {
+                // ColorOS may nest thumbnails outside *TaskView* naming — rasterize the panel.
+                paintPanelIntoRegion(recents, canvas, globalToTarget, region);
+            }
+        }
+        // "清除" lives in OplusClearAllPanelView — sibling under Overview, not inside RecentsView.
+        View clearPanel = findClearAllPanel(root, recents);
+        if (clearPanel != null
+                && clearPanel.getVisibility() == View.VISIBLE
+                && clearPanel.getAlpha() > 0.01f) {
+            paintClearAllIntoRegion(clearPanel, canvas, globalToTarget, region);
         }
     }
 
@@ -124,13 +131,23 @@ public final class TaskContentOverlay {
     /** HW/software rasterize an Overview panel and blit into the float-menu crop. */
     private static void paintPanelIntoRegion(View panel, Canvas canvas, Matrix globalToTarget,
             RectF region) {
+        paintPanelIntoRegion(panel, canvas, globalToTarget, region, false);
+    }
+
+    /**
+     * @param sparseOk when true, skip {@link #isMostlyEmpty} (clear button is mostly
+     *                 transparent chrome + LiquidGlass by design).
+     */
+    private static void paintPanelIntoRegion(View panel, Canvas canvas, Matrix globalToTarget,
+            RectF region, boolean sparseOk) {
         if (panel == null || !intersectsRegion(region, panel)) return;
         int w = panel.getWidth();
         int h = panel.getHeight();
         if (w <= 0 || h <= 0) return;
 
         Bitmap rendered = GlassHwRasterizer.render(w, h, panel::draw);
-        if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+        if (rendered == null || rendered.isRecycled()
+                || (!sparseOk && isMostlyEmpty(rendered))) {
             if (rendered != null && !rendered.isRecycled()) rendered.recycle();
             rendered = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             try {
@@ -140,6 +157,10 @@ public final class TaskContentOverlay {
             } catch (Throwable t) {
                 rendered.recycle();
                 Log.w(TAG, "paintPanelIntoRegion software draw failed", t);
+                return;
+            }
+            if (!sparseOk && isMostlyEmpty(rendered)) {
+                rendered.recycle();
                 return;
             }
         }
@@ -158,6 +179,42 @@ public final class TaskContentOverlay {
         } finally {
             if (!rendered.isRecycled()) rendered.recycle();
         }
+    }
+
+    /** Paint Overview "清除" panel (PressFeedbackButton + LiquidGlass) into the sample. */
+    private static void paintClearAllIntoRegion(View panel, Canvas canvas, Matrix globalToTarget,
+            RectF region) {
+        if (panel == null) return;
+        // Prefer the button (owns LiquidGlass); fall back to the whole panel.
+        View button = findClearAllButton(panel);
+        View target = button != null
+                && button.getVisibility() == View.VISIBLE
+                && button.getWidth() > 0 && button.getHeight() > 0
+                && intersectsRegion(region, button)
+                ? button : panel;
+        paintPanelIntoRegion(target, canvas, globalToTarget, region, true);
+    }
+
+    private static View findClearAllButton(View panel) {
+        Object btn = field(panel, "mClearAllBtn");
+        if (btn instanceof View) return (View) btn;
+        btn = invokeNoArgs(panel, "getClearAllButton");
+        if (btn instanceof View) return (View) btn;
+        return findPressFeedbackButton(panel);
+    }
+
+    private static View findPressFeedbackButton(View root) {
+        if (root == null) return null;
+        String name = root.getClass().getName();
+        if (name != null && name.contains("PressFeedbackButton")) return root;
+        if (root instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) root;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View found = findPressFeedbackButton(g.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     private static boolean isMostlyEmpty(Bitmap bitmap) {
@@ -219,6 +276,60 @@ public final class TaskContentOverlay {
             }
         }
         return null;
+    }
+
+    /**
+     * ColorOS Overview "清除" host: {@code OplusClearAllPanelView} (PressFeedbackButton inside).
+     * Prefer a DragLayer / Overview sibling of RecentsView; fall back to decor scan.
+     */
+    private static View findClearAllPanel(View root, View recents) {
+        ViewParent parent = recents != null ? recents.getParent() : null;
+        if (parent instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) parent;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (isClearAllPanel(child)) return child;
+                View nested = findClearAllPanelInTree(child);
+                if (nested != null) return nested;
+            }
+        }
+        Object launcher = resolveLauncher(root instanceof View ? (View) root : null);
+        for (String name : new String[] {
+                "mClearAllPanel", "mClearAllButton", "getClearAllPanel", "getClearAllButton"
+        }) {
+            Object v = name.startsWith("get") ? invokeNoArgs(launcher, name) : field(launcher, name);
+            if (v instanceof View && isClearAllPanel((View) v)) return (View) v;
+            if (v instanceof View) {
+                View nested = findClearAllPanelInTree((View) v);
+                if (nested != null) return nested;
+            }
+        }
+        return findClearAllPanelInTree(root);
+    }
+
+    private static View findClearAllPanelInTree(View root) {
+        if (root == null) return null;
+        if (isClearAllPanel(root)) return root;
+        if (root instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) root;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View found = findClearAllPanelInTree(g.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isClearAllPanel(View view) {
+        if (view == null) return false;
+        for (Class<?> c = view.getClass(); c != null; c = c.getSuperclass()) {
+            String name = c.getSimpleName();
+            if (name == null) continue;
+            if (name.contains("ClearAllPanel") || name.equals("OplusClearAllPanelView")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Object resolveLauncher(View seed) {

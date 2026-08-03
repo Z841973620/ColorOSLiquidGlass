@@ -3,6 +3,8 @@ package net.z841973620.colorosliquidglass.hook;
 import android.animation.ObjectAnimator;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
@@ -15,19 +17,32 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 import net.z841973620.colorosliquidglass.GlassConfig;
+import net.z841973620.colorosliquidglass.glass.BehindDisplayCapture;
+import net.z841973620.colorosliquidglass.glass.DesktopBackdropSampler;
 import net.z841973620.colorosliquidglass.glass.GlassDrawable;
 import net.z841973620.colorosliquidglass.glass.GlassInstaller;
+import net.z841973620.colorosliquidglass.glass.LauncherAshmemMode;
+import net.z841973620.colorosliquidglass.glass.TaskContentOverlay;
 import net.z841973620.colorosliquidglass.glass.WallpaperScaleTracker;
+import net.z841973620.colorosliquidglass.ipc.DesktopBackdropClient;
+import net.z841973620.colorosliquidglass.ipc.DesktopBackdropHub;
 
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 
 public final class ModuleMain extends XposedModule {
     private static final String TAG = "ColorOSLiquidGlass";
     private final Set<Executable> hooked = new HashSet<>();
+    /** OEM {@code mBgDrawable} swapped out while LiquidGlass owns the preview plate. */
+    private static final Map<Object, Drawable> SAVED_PREVIEW_OEM_BG =
+            Collections.synchronizedMap(new WeakHashMap<>());
+    private static final ColorDrawable TRANSPARENT_PREVIEW_BG = new ColorDrawable(Color.TRANSPARENT);
     private SharedPreferences remotePreferences;
     /** True while a folder DragView is active; also used with TOGGLE_BAR blur suppression. */
     private volatile boolean folderDragActive;
@@ -45,10 +60,12 @@ public final class ModuleMain extends XposedModule {
     private Runnable pageIndicatorExitRelease;
     /** Bumps when a new unlock/resume refresh burst starts so older delayed posts are ignored. */
     private volatile int unlockGlassRefreshToken;
+    /** Delayed float-menu glass applies — cancelled on dismiss so they cannot reopen ashmem. */
+    private final java.util.ArrayList<Runnable> pendingFloatMenuGlass = new java.util.ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     @Override public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         String pkg = param.getPackageName();
-        if (!pkg.equals("com.android.launcher")) return;
+        if (!pkg.equals("com.android.launcher") && !pkg.equals("com.android.systemui")) return;
         try {
             remotePreferences = getRemotePreferences(GlassConfig.PREFS);
             GlassConfig loaded = GlassConfig.read(remotePreferences);
@@ -62,7 +79,13 @@ public final class ModuleMain extends XposedModule {
         // Do not return for !isFirstPackage or enabled=false. ColorOS may expose the useful
         // ClassLoader in a later callback, and hooks must already exist when the next config is read.
         ClassLoader cl = param.getDefaultClassLoader();
-        hookLauncher(cl);
+        if (pkg.equals("com.android.launcher")) {
+            hookLauncher(cl);
+        } else {
+            // Live float app-options menus run in SystemUI (WM Shell), not Launcher.
+            hookSystemUiFloatMenus(cl);
+            DesktopBackdropClient.warmUp();
+        }
     }
 
     private void hookLauncher(ClassLoader cl) {
@@ -70,6 +93,7 @@ public final class ModuleMain extends XposedModule {
         // FolderIcon still dispatches this child while the open animation is running, so a glass
         // background on the container obscures the opened folder's icons.
         hookFolderPreviewBackground(cl);
+        hookCreateFolderPreviewGlass(cl);
         hookFolderVisibility(cl);
         hookFolderRefreshEvents(cl);
         hookFolderPopupBlur(cl);
@@ -82,10 +106,91 @@ public final class ModuleMain extends XposedModule {
         hookWorkspaceDragOver(cl);
         hookUnlockGlassRefresh(cl);
         hookWallpaperScaleTracking(cl);
+        hookDesktopBackdropIpc(cl);
         after("com.android.launcher3.folder.FolderIcon", cl, "onFolderClose", o -> {
             endFolderOpen(o);
             syncFolderIconDeferred(o, true);
         });
+    }
+
+    /**
+     * Export folder-glass-equivalent desktop tiles to SystemUI float menus via SharedMemory.
+     */
+    private void hookDesktopBackdropIpc(ClassLoader cl) {
+        DesktopBackdropHub.start();
+        after("com.android.launcher3.Launcher", cl, "onResume", launcher -> {
+            attachDesktopBackdropRoot(launcher);
+            DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher.Launcher", cl, "onResume", launcher -> {
+            attachDesktopBackdropRoot(launcher);
+            DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.Launcher", cl, "onAttachedToWindow", this::attachDesktopBackdropRoot);
+        after("com.android.launcher.Launcher", cl, "onAttachedToWindow", this::attachDesktopBackdropRoot);
+        after("com.android.launcher3.Workspace", cl, "scrollTo", o ->
+                DesktopBackdropSampler.invalidateAll());
+        after("com.android.launcher3.OplusWorkspace", cl, "scrollTo", o ->
+                DesktopBackdropSampler.invalidateAll());
+        after("com.android.launcher3.Workspace", cl, "onScrollChanged", o ->
+                DesktopBackdropSampler.invalidateAll());
+        after("com.android.launcher3.OplusWorkspace", cl, "onScrollChanged", o ->
+                DesktopBackdropSampler.invalidateAll());
+        after("com.android.launcher3.CellLayout", cl, "onLayout", o ->
+                DesktopBackdropSampler.invalidateCache());
+        after("com.android.launcher3.CellLayout", cl, "onViewAdded", o ->
+                DesktopBackdropSampler.invalidateCache());
+        after("com.android.launcher3.CellLayout", cl, "onViewRemoved", o ->
+                DesktopBackdropSampler.invalidateCache());
+        after("com.android.launcher3.hotseat.OplusHotseat", cl, "onLayout", o ->
+                DesktopBackdropSampler.invalidateCache());
+        after("com.android.launcher3.dragndrop.DragView", cl, "move", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.dragndrop.OplusDragView", cl, "move", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        // ColorOS may reposition via translation/layout instead of move() — keep glass streaming.
+        after("com.android.launcher3.dragndrop.DragView", cl, "setTranslationX", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.dragndrop.DragView", cl, "setTranslationY", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.dragndrop.OplusDragView", cl, "setTranslationX", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.dragndrop.OplusDragView", cl, "setTranslationY", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.popup.OplusPopupContainerWithArrow", cl, "onLayout", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher3.popup.PopupContainerWithArrow", cl, "onLayout", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher.layout.ItemResizeFrame", cl, "dispatchDraw", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+        after("com.android.launcher.layout.ItemResizeFrame", cl, "onLayout", o -> {
+            if (DesktopBackdropHub.isLive()) DesktopBackdropSampler.invalidateCache();
+        });
+    }
+
+    private void attachDesktopBackdropRoot(Object launcher) {
+        try {
+            if (launcher instanceof android.app.Activity) {
+                View decor = ((android.app.Activity) launcher).getWindow().getDecorView();
+                DesktopBackdropSampler.setLauncherRoot(decor);
+            } else {
+                Object window = invokeNoArgs(launcher, "getWindow");
+                Object decor = invokeNoArgs(window, "getDecorView");
+                if (decor instanceof View) DesktopBackdropSampler.setLauncherRoot((View) decor);
+            }
+            syncDesktopHomeValidForLauncher(launcher);
+        } catch (Throwable e) {
+            log(5, TAG, "attachDesktopBackdropRoot failed", e);
+        }
     }
 
     private void hookFolderPreviewBackground(ClassLoader cl) {
@@ -124,40 +229,101 @@ public final class ModuleMain extends XposedModule {
                 }
             });
 
-            // Drag-over accept hides mBgView and paints OEM blur via CellLayout delegate.
-            // Keep the glass-bearing mBgView visible; drawBackground(Canvas,View) already
-            // no-ops OEM fill when LiquidGlass is installed.
+            // Drag-over accept / create-folder: OEM hides mBgView and paints via CellLayout.
+            // Keep canvas glass only while delegated; restore FolderIcon plate on rest.
             for (Method m : c.getDeclaredMethods()) {
                 if (m.isBridge() || m.isSynthetic()) continue;
                 String name = m.getName();
                 if (!(name.equals("animateToAccept")
-                        || name.equals("animateToRest")
                         || name.equals("clearDrawingDelegate")
                         || name.equals("delegateDrawing")
                         || name.equals("lambda$animateToAccept$0"))) continue;
+                final String methodName = name;
                 hookOnce(m, chain -> {
+                    Object preview = chain.getThisObject();
+                    boolean createFolder = resolvePreviewFolderIcon(preview) == null;
+                    // CellLayout-parked glass host: OEM clearDrawingDelegate sets VISIBLE and the
+                    // plate would remain as a drawn child — hide/detach before proceed.
+                    if (methodName.equals("clearDrawingDelegate") && createFolder) {
+                        hideAndDetachCreateFolderCaptureHost(preview);
+                    }
                     Object result = chain.proceed();
                     try {
-                        keepHoverFolderGlassVisible(chain.getThisObject());
+                        if (methodName.equals("clearDrawingDelegate")) {
+                            if (createFolder) {
+                                finishCreateFolderPreviewCleanup(preview);
+                            } else {
+                                restoreFolderPreviewAfterDelegate(preview);
+                                keepHoverFolderGlassVisible(preview);
+                            }
+                        } else if (methodName.equals("animateToAccept")
+                                || methodName.equals("lambda$animateToAccept$0")
+                                || methodName.equals("delegateDrawing")) {
+                            placeCreateFolderBgForCapture(preview);
+                            keepHoverFolderGlassVisible(preview);
+                        }
+                        if (DesktopBackdropHub.isLive()) {
+                            DesktopBackdropSampler.invalidateCache();
+                        }
                     } catch (Throwable e) {
-                        log(5, TAG, className + "." + name + " hover glass failed", e);
+                        log(5, TAG, className + "." + methodName + " hover glass failed", e);
                     }
                     return result;
                 });
             }
 
-            // ColorOS also paints mBgDrawable directly from PreviewBackground.drawBackground;
-            // suppress that object-level blur/background after the dedicated mBgView owns glass.
+            // animateToRest lives on PreviewBackground (not overridden) — cancel create-folder
+            // immediately so glass does not linger through the 100ms rest animation / VISIBLE flash.
+            try {
+                Class<?> previewBg = Class.forName(
+                        "com.android.launcher3.folder.PreviewBackground", false, cl);
+                for (Method m : previewBg.getDeclaredMethods()) {
+                    if (!m.getName().equals("animateToRest") || m.isBridge() || m.isSynthetic()) {
+                        continue;
+                    }
+                    hookOnce(m, chain -> {
+                        Object preview = chain.getThisObject();
+                        Object result = chain.proceed();
+                        try {
+                            if (resolvePreviewFolderIcon(preview) == null) {
+                                cleanupCreateFolderPreview(preview);
+                            } else {
+                                restoreFolderPreviewAfterDelegate(preview);
+                                keepHoverFolderGlassVisible(preview);
+                            }
+                            if (DesktopBackdropHub.isLive()) {
+                                DesktopBackdropSampler.invalidateCache();
+                            }
+                        } catch (Throwable e) {
+                            log(5, TAG, "PreviewBackground.animateToRest cleanup failed", e);
+                        }
+                        return result;
+                    });
+                }
+            } catch (Throwable e) {
+                log(5, TAG, "PreviewBackground.animateToRest hook unavailable", e);
+            }
+
+            // ColorOS paints translucent folder_icon_bg / LayerBlur via drawBackground while
+            // mBgView is hidden. Replace with LiquidGlass and never fall through to OEM tint.
             try {
                 Method drawBackground = c.getDeclaredMethod("drawBackground", Canvas.class, View.class);
                 hookOnce(drawBackground, chain -> {
                     if (!enabled()) return chain.proceed();
+                    // Capture re-entrancy: do not paint glass/OEM into the backdrop sample.
+                    if (GlassInstaller.isPreviewBackdropCapturing()) return null;
                     Object preview = chain.getThisObject();
-                    Object bgView = field(preview, "mBgView");
-                    if (bgView instanceof View && GlassInstaller.get((View) bgView) != null) {
-                        return null;
+                    try {
+                        suppressOemPreviewDrawable(preview);
+                        if (drawPreviewGlassOnCanvas(preview, (Canvas) chain.getArg(0))) {
+                            return null;
+                        }
+                    } catch (Throwable e) {
+                        log(5, TAG, "OplusPreviewBackground.drawBackground glass failed", e);
                     }
-                    return chain.proceed();
+                    // Prefer empty plate over OEM translucent folder_icon_bg brightening glass.
+                    suppressOemPreviewDrawable(preview);
+                    return null;
                 });
             } catch (Throwable e) {
                 log(5, TAG, "OplusPreviewBackground.drawBackground hook unavailable", e);
@@ -646,20 +812,50 @@ public final class ModuleMain extends XposedModule {
         after("com.android.launcher3.dragndrop.DragController", cl, "cancelDrag", o -> {
             if (folderDragActive) endFolderDrag(field(o, "mActivity"));
         });
-        // Click-open folder: FolderAnimUtil animates wallpaper blur 0->1; clear it.
-        try {
-            Class<?> folder = Class.forName("com.android.launcher3.folder.Folder", false, cl);
-            for (Method m : folder.getDeclaredMethods()) {
-                if (!m.getName().equals("animateOpen") || m.isBridge() || m.isSynthetic()) continue;
-                hookOnce(m, chain -> {
-                    if (enabled()) beginFolderOpen(chain.getThisObject());
-                    Object result = chain.proceed();
-                    if (enabled()) forceDepthBlur(chain.getThisObject(), 0f);
-                    return result;
-                });
+        // Click-open / spring-load folder: FolderAnimUtil animates wallpaper blur 0->1; clear it.
+        // Also invalidate ashmem so float-menu glass switches to the opened folder page.
+        for (String folderClass : new String[] {
+                "com.android.launcher3.folder.Folder",
+                "com.android.launcher3.folder.OplusFolder"
+        }) {
+            try {
+                Class<?> folder = Class.forName(folderClass, false, cl);
+                for (Method m : folder.getDeclaredMethods()) {
+                    String name = m.getName();
+                    if (m.isBridge() || m.isSynthetic()) continue;
+                    if (!(name.equals("animateOpen")
+                            || name.equals("beginExternalDrag")
+                            || name.equals("onDropCompleted")
+                            || name.equals("bind"))) {
+                        continue;
+                    }
+                    if (name.equals("bind") && m.getParameterCount() == 0) continue;
+                    final String hooked = name;
+                    hookOnce(m, chain -> {
+                        Object result = chain.proceed();
+                        if (!enabled()) return result;
+                        try {
+                            Object self = chain.getThisObject();
+                            Object open = invokeNoArgs(self, "isOpen");
+                            boolean isOpen = open instanceof Boolean ? (Boolean) open
+                                    : Boolean.TRUE.equals(field(self, "mIsOpen"));
+                            if (hooked.equals("animateOpen") || hooked.equals("beginExternalDrag")
+                                    || isOpen) {
+                                beginFolderOpen(self);
+                                forceDepthBlur(self, 0f);
+                                if (DesktopBackdropHub.isLive()) {
+                                    DesktopBackdropSampler.invalidateCache();
+                                }
+                            }
+                        } catch (Throwable e) {
+                            log(5, TAG, folderClass + "." + hooked + " open glass failed", e);
+                        }
+                        return result;
+                    });
+                }
+            } catch (Throwable e) {
+                log(5, TAG, folderClass + " open hooks unavailable", e);
             }
-        } catch (Throwable e) {
-            log(5, TAG, "Folder.animateOpen blur hook unavailable", e);
         }
         // Long-press edit / Recents enter states with wallpaper blur=1; clear it.
         after("com.android.launcher3.statemanager.StateManager", cl, "goToState", o -> {
@@ -668,6 +864,7 @@ public final class ModuleMain extends XposedModule {
             if (activity == null) activity = field(o, "mContext");
             if (shouldSuppressDepthBlurForLauncher(activity)) forceDepthBlur(activity, 0f);
             syncPagePreviewFrameGlassForLauncher(activity);
+            syncDesktopHomeValidForLauncher(activity);
         });
         after("com.android.launcher3.statemanager.StateManager", cl, "onStateTransitionEnd", o -> {
             if (!enabled()) return;
@@ -675,6 +872,7 @@ public final class ModuleMain extends XposedModule {
             if (activity == null) activity = field(o, "mContext");
             if (shouldSuppressDepthBlurForLauncher(activity)) forceDepthBlur(activity, 0f);
             syncPagePreviewFrameGlassForLauncher(activity);
+            syncDesktopHomeValidForLauncher(activity);
         });
     }
 
@@ -769,6 +967,9 @@ public final class ModuleMain extends XposedModule {
                             return result;
                         }
                         applyTaskMenuGlass(chain.getThisObject());
+                        if (hooked.equals("animateOpenOrClosed")) {
+                            scheduleTaskMenuGlassSettle(chain.getThisObject());
+                        }
                     } catch (Throwable e) {
                         log(5, TAG, "OplusTaskMenuViewImpl." + hooked + " glass failed", e);
                     }
@@ -897,7 +1098,6 @@ public final class ModuleMain extends XposedModule {
                     live.setCornerRadii(radius, radius, radius, radius);
                 }
                 boolean sizeChanged = glassHost.getWidth() != prevW || glassHost.getHeight() != prevH;
-                // Avoid forceCapture on every gesture progress tick — onPreDraw handles motion.
                 if (firstInstall || sizeChanged) {
                     GlassInstaller.forceCapture(glassHost);
                 }
@@ -1025,6 +1225,41 @@ public final class ModuleMain extends XposedModule {
         return null;
     }
 
+    /**
+     * Menu open anim scales 0.9→1 over ~400ms. Re-bake protect and forceCapture when it
+     * lands so the glass sample is not left at a ~0.99-scale freeze (upward jump / shrink).
+     */
+    private void scheduleTaskMenuGlassSettle(Object menu) {
+        if (!(menu instanceof View)) return;
+        final View host = (View) menu;
+        Object listObj = field(menu, "mListView");
+        final View glassHost = listObj instanceof View ? (View) listObj : host;
+        final View taskView = resolveTaskMenuTaskView(menu);
+        Runnable settle = new Runnable() {
+            int tries = 0;
+            @Override public void run() {
+                try {
+                    if (!enabled() || !glassHost.isAttachedToWindow()) return;
+                    if ((Math.abs(host.getScaleX() - 1f) > 0.02f
+                            || Math.abs(host.getScaleY() - 1f) > 0.02f)
+                            && tries++ < 12) {
+                        host.postDelayed(this, 50L);
+                        return;
+                    }
+                    if (taskView != null) {
+                        TaskContentOverlay.clearProtectCache(taskView);
+                        TaskContentOverlay.prebakeProtect(taskView);
+                    }
+                    GlassInstaller.forceCapture(glassHost);
+                    glassHost.invalidate();
+                } catch (Throwable t) {
+                    log(5, TAG, "task menu glass settle failed", t);
+                }
+            }
+        };
+        host.postDelayed(settle, 400L);
+    }
+
     /** LiquidGlass behind the Recents ··· popup that also lists 分屏 / 浮窗. */
     private void applyTaskMenuGlass(Object menu) {
         if (!enabled() || !(menu instanceof View)) return;
@@ -1034,53 +1269,60 @@ public final class ModuleMain extends XposedModule {
             final View listView = listObj instanceof View ? (View) listObj : null;
             clearTaskMenuOpaqueChrome(menu, listView);
 
-            // Glass must stay on the HW-accelerated menu wrapper. ListView backgrounds are
-            // often drawn without AGSL-capable acceleration, which drops the liquid look.
-            if (listView != null && GlassInstaller.get(listView) != null) {
-                GlassInstaller.uninstall(listView);
+            // Prefer ListView as glass host: it owns the rounded popup panel bounds.
+            final View glassHost = listView != null ? listView : host;
+            if (listView != null && host.getBackground() instanceof GlassDrawable) {
+                // Avoid double glass if we previously installed on the LinearLayout wrapper.
+                GlassInstaller.uninstall(host);
             }
-            GlassInstaller.installBackground(host, currentConfig());
+            if (host != glassHost) host.setBackground(null);
+
+            GlassInstaller.installBackground(glassHost, currentConfig());
             View taskView = resolveTaskMenuTaskView(menu);
             if (taskView != null) {
-                GlassInstaller.setOverlaySource(host, taskView);
+                GlassInstaller.setOverlaySource(glassHost, taskView);
+                // Bake protect content-layer BEFORE open animation so glass never shows an
+                // empty/wrong plate over the real mask (ghosting) or rebakes at expand-max.
+                TaskContentOverlay.prebakeProtect(taskView);
             }
             final View taskOverlay = taskView;
             Runnable refresh = () -> {
                 clearTaskMenuOpaqueChrome(menu, listView);
-                // Reassert glass if OEM chrome wipe raced us — never leave a null background.
-                if (GlassInstaller.get(host) == null
-                        || !(host.getBackground() instanceof GlassDrawable)) {
-                    GlassInstaller.installBackground(host, currentConfig());
+                if (!(glassHost.getBackground() instanceof GlassDrawable)) {
+                    GlassInstaller.installBackground(glassHost, currentConfig());
                 }
-                GlassDrawable live = GlassInstaller.get(host);
+                GlassDrawable live = GlassInstaller.get(glassHost);
                 if (live == null) return;
-                float radius = readTaskMenuRadius(host);
+                float radius = readTaskMenuRadius(glassHost);
                 if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
-                if (host.getWidth() <= 0 || host.getHeight() <= 0) return;
+                if (glassHost.getWidth() <= 0 || glassHost.getHeight() <= 0) return;
                 if (taskOverlay != null) {
-                    GlassInstaller.setOverlaySource(host, taskOverlay);
+                    GlassInstaller.setOverlaySource(glassHost, taskOverlay);
                 }
-                GlassInstaller.forceCapture(host);
-                host.invalidate();
+                GlassInstaller.forceCapture(glassHost);
+                glassHost.invalidate();
                 log(4, TAG, "TaskMenu glass ready size="
-                        + host.getWidth() + "x" + host.getHeight()
+                        + glassHost.getWidth() + "x" + glassHost.getHeight()
                         + " radius=" + radius
-                        + " taskOverlay=" + (taskOverlay != null));
+                        + " taskOverlay=" + (taskOverlay != null)
+                        + " host=" + glassHost.getClass().getSimpleName());
             };
-            if (host.getWidth() > 0 && host.getHeight() > 0) {
+            if (glassHost.getWidth() > 0 && glassHost.getHeight() > 0) {
                 refresh.run();
-                host.post(refresh);
-                host.postDelayed(refresh, 160L);
+                // One follow-up after first layout — protect cache is locked so this cannot jump.
+                glassHost.post(refresh);
             } else {
-                host.post(refresh);
-                host.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                glassHost.post(refresh);
+                glassHost.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
                     @Override
                     public void onLayoutChange(View v, int left, int top, int right, int bottom,
                             int oldLeft, int oldTop, int oldRight, int oldBottom) {
                         if (v.getWidth() > 0 && v.getHeight() > 0) {
                             v.removeOnLayoutChangeListener(this);
+                            if (taskOverlay != null) {
+                                TaskContentOverlay.prebakeProtect(taskOverlay);
+                            }
                             refresh.run();
-                            v.postDelayed(refresh, 160L);
                         }
                     }
                 });
@@ -1103,10 +1345,11 @@ public final class ModuleMain extends XposedModule {
     /**
      * Strip opaque OEM chrome that sits above LiquidGlass: ListView popup drawable,
      * RoundFrameLayout white fill, and the #ebebeb group divider between 分屏 and 锁定.
-     * Never clears a {@link GlassDrawable} background.
      */
     private void clearTaskMenuOpaqueChrome(Object menu, View listView) {
         if (listView != null) {
+            // Never wipe an already-installed GlassDrawable — that left a clear hole
+            // showing only the TaskView content underneath.
             if (!(listView.getBackground() instanceof GlassDrawable)) {
                 listView.setBackground(null);
             }
@@ -1117,6 +1360,7 @@ public final class ModuleMain extends XposedModule {
                     roundFrame.setBackground(null);
                 }
                 try {
+                    // clipMode 1 forces setBackgroundColor(-1); keep clip but no opaque fill.
                     invoke(roundFrame, "setClipMode", new Class<?>[] { int.class }, 0);
                 } catch (Throwable ignored) { }
                 if (!(roundFrame.getBackground() instanceof GlassDrawable)) {
@@ -1138,6 +1382,13 @@ public final class ModuleMain extends XposedModule {
                         public void onChildViewRemoved(View parent, View child) { }
                     });
                 }
+            }
+        }
+        if (menu instanceof View) {
+            View menuView = (View) menu;
+            // OEM solid shape on the wrapper would flash white around the ListView glass.
+            if (!(menuView.getBackground() instanceof GlassDrawable)) {
+                menuView.setBackground(null);
             }
         }
     }
@@ -1195,6 +1446,435 @@ public final class ModuleMain extends XposedModule {
             if (id != 0) return view.getResources().getDimension(id);
         } catch (Throwable ignored) { }
         return 12f * view.getResources().getDisplayMetrics().density;
+    }
+
+    /**
+     * Live float app-options menus run in SystemUI (WM Shell), not Launcher:
+     * {@code FlexibleMenuManager} → {@code COUIIsolatedPopupListWindow}
+     * ({@code RoundFrameLayout mMainMenuWrapper}).
+     * Split-screen menus are intentionally skipped for now.
+     */
+    private void hookSystemUiFloatMenus(ClassLoader cl) {
+        after("com.oplus.flexibletask.menu.FlexibleMenuManager", cl, "showPopupWindowMenu",
+                this::scheduleFlexibleMenuGlass);
+        // showPopupWindowMenu only posts work; glass after the real addView lambda.
+        try {
+            Class<?> mgr = Class.forName(
+                    "com.oplus.flexibletask.menu.FlexibleMenuManager", false, cl);
+            for (Method m : mgr.getDeclaredMethods()) {
+                String name = m.getName();
+                if (m.isBridge() || !name.contains("showPopupWindowMenu")
+                        || name.equals("showPopupWindowMenu")) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (enabled()) applyFlexibleMenuGlass(chain.getThisObject());
+                    } catch (Throwable e) {
+                        log(5, TAG, "FlexibleMenuManager." + name + " glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "FlexibleMenuManager lambda glass hooks unavailable", e);
+        }
+        // Backup: prepareShowMainMenu runs right before WM.addView for float menus.
+        after("com.coui.appcompat.poplist.COUIIsolatedPopupListWindow", cl, "prepareShowMainMenu",
+                this::scheduleCouiPopupListGlass);
+        // Re-bind DESKTOP/APP when the float bounds update while the menu is open.
+        after("com.oplus.flexibletask.menu.FlexibleMenuManager", cl, "updateInfo", manager -> {
+            try {
+                if (!DesktopBackdropClient.isReady()) return;
+                Object popup = field(manager, "mPopupWindow");
+                View wrapper = asView(field(popup, "mMainMenuWrapper"));
+                if (wrapper == null || !wrapper.isAttachedToWindow()) return;
+                if (!BehindDisplayCapture.isSysUiMenuGlass(wrapper)) return;
+                bindFloatMenuCapture(wrapper, manager);
+                GlassInstaller.forceCapture(wrapper);
+            } catch (Throwable ignored) { }
+        });
+        // Dismiss / hide must cancel delayed glass posts and STOP Launcher ashmem publish.
+        after("com.oplus.flexibletask.menu.FlexibleMenuManager", cl, "dismiss",
+                this::stopFloatMenuAshmem);
+        after("com.oplus.flexibletask.menu.FlexibleMenuManager", cl, "hidePopupWindow",
+                this::stopFloatMenuAshmem);
+        after("com.oplus.flexibletask.menu.FlexibleMenuManager", cl, "hide",
+                this::stopFloatMenuAshmem);
+        after("com.coui.appcompat.poplist.COUIIsolatedPopupListWindow", cl, "dismiss",
+                this::stopFloatMenuAshmem);
+        after("com.coui.appcompat.poplist.COUIIsolatedPopupListWindow", cl, "dismissAllowingStateLoss",
+                this::stopFloatMenuAshmem);
+        after("android.widget.PopupWindow", cl, "dismiss", popup -> {
+            try {
+                if (popup != null && popup.getClass().getName().contains("COUIIsolatedPopupListWindow")) {
+                    stopFloatMenuAshmem(popup);
+                }
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    private void cancelPendingFloatMenuGlass() {
+        synchronized (pendingFloatMenuGlass) {
+            for (Runnable r : pendingFloatMenuGlass) {
+                mainHandler.removeCallbacks(r);
+            }
+            pendingFloatMenuGlass.clear();
+        }
+    }
+
+    private void trackFloatMenuGlass(Runnable r) {
+        synchronized (pendingFloatMenuGlass) {
+            pendingFloatMenuGlass.add(r);
+        }
+    }
+
+    private void stopFloatMenuAshmem(Object ignored) {
+        try {
+            cancelPendingFloatMenuGlass();
+            BehindDisplayCapture.stopAllSessions();
+        } catch (Throwable t) {
+            log(5, TAG, "stopFloatMenuAshmem failed", t);
+        }
+    }
+
+    private void scheduleFlexibleMenuGlass(Object manager) {
+        if (!enabled() || manager == null) return;
+        cancelPendingFloatMenuGlass();
+        final int epoch = DesktopBackdropClient.sessionEpoch();
+        Runnable apply = () -> {
+            try {
+                if (DesktopBackdropClient.sessionEpoch() != epoch) return;
+                applyFlexibleMenuGlass(manager);
+            } catch (Throwable e) {
+                log(5, TAG, "applyFlexibleMenuGlass failed", e);
+            }
+        };
+        trackFloatMenuGlass(apply);
+        mainHandler.post(apply);
+        mainHandler.postDelayed(apply, 80L);
+        mainHandler.postDelayed(apply, 220L);
+        mainHandler.postDelayed(apply, 480L);
+    }
+
+    private void applyFlexibleMenuGlass(Object manager) {
+        if (!enabled() || manager == null) return;
+        Object popup = field(manager, "mPopupWindow");
+        if (popup == null) popup = invokeNoArgs(manager, "getPopupWindow");
+        applyCouiPopupListGlass(popup, manager);
+    }
+
+    private void scheduleCouiPopupListGlass(Object popup) {
+        if (!enabled() || popup == null) return;
+        cancelPendingFloatMenuGlass();
+        final int epoch = DesktopBackdropClient.sessionEpoch();
+        Runnable apply = () -> {
+            try {
+                if (DesktopBackdropClient.sessionEpoch() != epoch) return;
+                applyCouiPopupListGlass(popup, null);
+            } catch (Throwable e) {
+                log(5, TAG, "applyCouiPopupListGlass failed", e);
+            }
+        };
+        trackFloatMenuGlass(apply);
+        mainHandler.post(apply);
+        mainHandler.postDelayed(apply, 80L);
+        mainHandler.postDelayed(apply, 220L);
+    }
+
+    private void applyCouiPopupListGlass(Object popup, Object flexibleManager) {
+        if (!enabled() || popup == null) return;
+        View resolvedWrapper = asView(field(popup, "mMainMenuWrapper"));
+        View resolvedList = asView(field(popup, "mMainListView"));
+        if (resolvedList == null) resolvedList = asView(invokeNoArgs(popup, "getMainMenuListView"));
+        if (resolvedWrapper == null && resolvedList != null) {
+            Object parent = resolvedList.getParent();
+            if (parent instanceof View) resolvedWrapper = (View) parent;
+        }
+        if (resolvedWrapper == null) {
+            View content = asView(invokeNoArgs(popup, "getContentView"));
+            if (content instanceof ViewGroup && ((ViewGroup) content).getChildCount() > 0) {
+                View child = ((ViewGroup) content).getChildAt(0);
+                if (child != null && child.getClass().getName().contains("RoundFrameLayout")) {
+                    resolvedWrapper = child;
+                }
+            }
+        }
+        final View wrapper = resolvedWrapper;
+        final View listView = resolvedList;
+        clearCouiPopupOpaqueChrome(wrapper, listView);
+        final View glassHost = wrapper != null ? wrapper : listView;
+        if (glassHost == null) return;
+        if (!glassHost.isAttachedToWindow()) return;
+        BehindDisplayCapture.tagHost(glassHost);
+        if (listView != null && listView != glassHost
+                && listView.getBackground() instanceof GlassDrawable) {
+            GlassInstaller.uninstall(listView);
+            listView.setBackground(null);
+        }
+        bindFloatMenuCapture(glassHost, flexibleManager);
+        try { glassHost.setLayerType(View.LAYER_TYPE_NONE, null); } catch (Throwable ignored) { }
+        GlassInstaller.installBackground(glassHost, currentConfig());
+        final int epoch = DesktopBackdropClient.sessionEpoch();
+        Runnable refresh = () -> {
+            if (DesktopBackdropClient.sessionEpoch() != epoch) return;
+            if (!glassHost.isAttachedToWindow()) return;
+            clearCouiPopupOpaqueChrome(wrapper, listView);
+            if (!(glassHost.getBackground() instanceof GlassDrawable)) {
+                GlassInstaller.installBackground(glassHost, currentConfig());
+            }
+            GlassDrawable live = GlassInstaller.get(glassHost);
+            if (live == null) return;
+            float radius = readCouiPopupRadius(glassHost);
+            if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
+            bindFloatMenuCapture(glassHost, flexibleManager);
+            if (glassHost.getWidth() <= 0 || glassHost.getHeight() <= 0) return;
+            GlassInstaller.forceCapture(glassHost);
+            glassHost.invalidate();
+            log(4, TAG, "Flexible/COUI popup glass ready size="
+                    + glassHost.getWidth() + "x" + glassHost.getHeight()
+                    + " radius=" + radius
+                    + " host=" + glassHost.getClass().getSimpleName());
+        };
+        trackFloatMenuGlass(refresh);
+        scheduleGlassRefresh(glassHost, refresh);
+    }
+
+    /**
+     * Ashmem only when the menu opens above the float <b>and</b> the launcher is visible
+     * under/around the float. Otherwise {@code captureDisplay} (same as downward menu).
+     */
+    private void bindFloatMenuCapture(View glassHost, Object flexibleManager) {
+        if (glassHost == null || !glassHost.isAttachedToWindow()) return;
+        try {
+            if (flexibleManager == null) {
+                BehindDisplayCapture.bindApp(glassHost, null);
+                return;
+            }
+            Object boundsObj = field(flexibleManager, "mCurrentBounds");
+            android.graphics.Rect floatBounds = boundsObj instanceof android.graphics.Rect
+                    ? new android.graphics.Rect((android.graphics.Rect) boundsObj) : null;
+            if (floatBounds != null && floatBounds.isEmpty()) floatBounds = null;
+
+            boolean above = floatBounds != null
+                    && isFloatMenuAbove(glassHost, floatBounds, flexibleManager);
+            boolean launcherUnder = isLauncherUnderFloat(glassHost, flexibleManager);
+            // Prefer Launcher ashmem while home or Overview is showing. PAGE_PREVIEW /
+            // TOGGLE_BAR clear desktopHomeValid so we fall back to captureDisplay.
+            boolean homeDesktop = launcherUnder && DesktopBackdropClient.isDesktopHomeValid();
+
+            if (above && homeDesktop) {
+                android.graphics.Rect maxMenu = computeMaxMenuRegion(
+                        glassHost, flexibleManager, floatBounds, true);
+                if (maxMenu == null || maxMenu.isEmpty()) {
+                    BehindDisplayCapture.bindApp(glassHost, floatBounds);
+                    log(4, TAG, "float menu capture APP (no max menu region)");
+                    return;
+                }
+                BehindDisplayCapture.bindDesktop(glassHost, floatBounds, maxMenu, true);
+                log(4, TAG, "float menu capture DESKTOP region=" + maxMenu.toShortString());
+            } else {
+                BehindDisplayCapture.bindApp(glassHost, floatBounds);
+                log(4, TAG, "float menu capture APP above=" + above
+                        + " launcherUnder=" + launcherUnder
+                        + " homeDesktop=" + homeDesktop);
+            }
+        } catch (Throwable t) {
+            log(5, TAG, "bindFloatMenuCapture failed", t);
+        }
+    }
+
+    /** True when home/launcher is visible behind the float (ashmem path is meaningful). */
+    private static boolean isLauncherUnderFloat(View host, Object flexibleManager) {
+        if (isFloatTaskLauncher(flexibleManager)) return true;
+        if (host == null) return false;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager)
+                    host.getContext().getSystemService(android.content.Context.ACTIVITY_SERVICE);
+            if (am == null) return false;
+            @SuppressWarnings("deprecation")
+            java.util.List<android.app.ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(12);
+            if (tasks == null) return false;
+            for (android.app.ActivityManager.RunningTaskInfo task : tasks) {
+                if (task == null) continue;
+                android.content.ComponentName top = task.topActivity;
+                if (top == null) top = task.baseActivity;
+                if (top != null && isLauncherPackage(top.getPackageName())) {
+                    try {
+                        if (task.isVisible()) return true;
+                    } catch (Throwable ignored) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    private static boolean isFloatTaskLauncher(Object flexibleManager) {
+        if (flexibleManager == null) return false;
+        try {
+            Object info = field(flexibleManager, "mTaskInfo");
+            if (info == null) return false;
+            Object top = field(info, "topActivity");
+            if (!(top instanceof android.content.ComponentName)) {
+                top = field(info, "realActivity");
+            }
+            if (!(top instanceof android.content.ComponentName)) {
+                top = field(info, "baseActivity");
+            }
+            if (top instanceof android.content.ComponentName) {
+                return isLauncherPackage(((android.content.ComponentName) top).getPackageName());
+            }
+            Object intent = field(info, "baseIntent");
+            if (intent instanceof android.content.Intent) {
+                android.content.ComponentName cn = ((android.content.Intent) intent).getComponent();
+                if (cn != null) return isLauncherPackage(cn.getPackageName());
+            }
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    private static boolean isLauncherPackage(String pkg) {
+        if (pkg == null) return false;
+        return pkg.equals("com.android.launcher")
+                || pkg.equals("com.android.launcher3")
+                || pkg.equals("com.oppo.launcher")
+                || pkg.equals("com.oplus.launcher")
+                || pkg.equals("com.coloros.launcher");
+    }
+
+    /**
+     * Fixed max menu screen rect for one OPEN signal.
+     * Prefer OEM mMenuWidth/Height + float anchor (stable) over animated host bounds so the
+     * ashmem region matches 1:1 screen pixels and does not skew aspect.
+     */
+    private static android.graphics.Rect computeMaxMenuRegion(View glassHost, Object flexibleManager,
+            android.graphics.Rect floatBounds, boolean above) {
+        int mw = 0;
+        int mh = 0;
+        Object wObj = field(flexibleManager, "mMenuWidth");
+        Object hObj = field(flexibleManager, "mMenuHeight");
+        if (wObj instanceof Integer) mw = (Integer) wObj;
+        if (hObj instanceof Integer) mh = (Integer) hObj;
+        if (mw <= 0 && glassHost.getWidth() > 0) mw = glassHost.getWidth();
+        if (mh <= 0 && glassHost.getHeight() > 0) mh = glassHost.getHeight();
+        if (mw <= 0 || mh <= 0) return null;
+
+        float density = glassHost.getResources().getDisplayMetrics().density;
+        int screenW = glassHost.getResources().getDisplayMetrics().widthPixels;
+        int screenH = glassHost.getResources().getDisplayMetrics().heightPixels;
+
+        // Prefer laid-out host origin when size already matches OEM max (post-animation).
+        if (glassHost.isAttachedToWindow() && glassHost.getWidth() > 0 && glassHost.getHeight() > 0
+                && Math.abs(glassHost.getWidth() - mw) <= 2
+                && Math.abs(glassHost.getHeight() - mh) <= 2) {
+            int[] loc = new int[2];
+            glassHost.getLocationOnScreen(loc);
+            return new android.graphics.Rect(loc[0], loc[1], loc[0] + mw, loc[1] + mh);
+        }
+
+        if (floatBounds == null || floatBounds.isEmpty()) {
+            if (glassHost.isAttachedToWindow() && glassHost.getWidth() > 0) {
+                int[] loc = new int[2];
+                glassHost.getLocationOnScreen(loc);
+                return new android.graphics.Rect(loc[0], loc[1], loc[0] + mw, loc[1] + mh);
+            }
+            return null;
+        }
+
+        int left = Math.max(0, Math.min(screenW - mw, floatBounds.centerX() - mw / 2));
+        int top;
+        if (above) {
+            int gap = Math.round(8f * density);
+            top = Math.max(0, floatBounds.top - gap - mh);
+        } else {
+            top = floatBounds.top + Math.round(8f * density);
+        }
+        if (top + mh > screenH) top = Math.max(0, screenH - mh);
+        return new android.graphics.Rect(left, top, left + mw, top + mh);
+    }
+
+    /**
+     * Default: menu anchors at {@code float.top + 8dp} and opens downward over the float.
+     * It flips above when there is not enough room below that anchor. Never treat an
+     * unlaid-out host at (0,0) as "above" — that sticky-locked DESKTOP and blanked glass.
+     */
+    private static boolean isFloatMenuAbove(View glassHost, android.graphics.Rect floatBounds,
+            Object flexibleManager) {
+        if (glassHost == null || floatBounds == null || floatBounds.isEmpty()) return false;
+        float density = glassHost.getResources().getDisplayMetrics().density;
+        int screenH = glassHost.getResources().getDisplayMetrics().heightPixels;
+        int menuH = 0;
+        Object menuHObj = field(flexibleManager, "mMenuHeight");
+        if (menuHObj instanceof Integer) menuH = (Integer) menuHObj;
+        int anchorY = floatBounds.top + Math.round(8f * density);
+        int bottomMargin = Math.round(16f * density);
+        if (menuH > 0 && anchorY + menuH > screenH - bottomMargin) return true;
+
+        int w = glassHost.getWidth();
+        int h = glassHost.getHeight();
+        if (w <= 0 || h <= 0 || !glassHost.isAttachedToWindow()) return false;
+        int[] loc = new int[2];
+        glassHost.getLocationOnScreen(loc);
+        if (loc[1] == 0 && loc[0] == 0 && floatBounds.top > h) return false;
+        return loc[1] < floatBounds.top;
+    }
+
+    private void clearCouiPopupOpaqueChrome(View wrapper, View listView) {
+        if (listView != null && !(listView.getBackground() instanceof GlassDrawable)) {
+            listView.setBackground(null);
+        }
+        if (wrapper != null && !(wrapper.getBackground() instanceof GlassDrawable)) {
+            try {
+                invoke(wrapper, "setClipMode", new Class<?>[] { int.class }, 0);
+            } catch (Throwable ignored) { }
+            if (!(wrapper.getBackground() instanceof GlassDrawable)) {
+                wrapper.setBackground(null);
+            }
+        }
+    }
+
+    private void scheduleGlassRefresh(View glassHost, Runnable refresh) {
+        if (glassHost == null || refresh == null) return;
+        if (glassHost.getWidth() > 0 && glassHost.getHeight() > 0) {
+            refresh.run();
+            glassHost.post(refresh);
+            glassHost.postDelayed(refresh, 120L);
+            glassHost.postDelayed(refresh, 400L);
+        } else {
+            glassHost.post(refresh);
+            glassHost.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                @Override
+                public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                        int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                    if (v.getWidth() > 0 && v.getHeight() > 0) {
+                        v.removeOnLayoutChangeListener(this);
+                        refresh.run();
+                        v.postDelayed(refresh, 120L);
+                        v.postDelayed(refresh, 400L);
+                    }
+                }
+            });
+        }
+    }
+
+    private static View asView(Object obj) {
+        return obj instanceof View ? (View) obj : null;
+    }
+
+    private static float readCouiPopupRadius(View view) {
+        try {
+            int id = view.getResources().getIdentifier(
+                    "coui_round_corner_m", "dimen", "com.support.appcompat");
+            if (id == 0) {
+                id = view.getResources().getIdentifier(
+                        "coui_round_corner_m", "dimen", view.getContext().getPackageName());
+            }
+            if (id != 0) return view.getResources().getDimension(id);
+        } catch (Throwable ignored) { }
+        return 16f * view.getResources().getDisplayMetrics().density;
     }
 
     private void applyTaskHeaderShortcutGlass(Object header) {
@@ -1441,6 +2121,9 @@ public final class ModuleMain extends XposedModule {
                 if (m.isBridge() || m.isSynthetic()) continue;
                 if (name.equals("drawBackgroundIfNeeded")) {
                     hookOnce(m, chain -> {
+                        if (GlassInstaller.suppressPageIndicatorBackground()) {
+                            return null;
+                        }
                         if (enabled() && shouldOwnPageIndicatorFrame(chain.getThisObject())) {
                             applyPageIndicatorFrameGlass(chain.getThisObject());
                             Object blurBg = field(chain.getThisObject(), "mBlurBgView");
@@ -2079,6 +2762,9 @@ public final class ModuleMain extends XposedModule {
     private void beginFolderOpen(Object folder) {
         folderOpenActive = true;
         forceDepthBlur(folder, 0f);
+        if (DesktopBackdropHub.isLive()) {
+            DesktopBackdropSampler.invalidateCache();
+        }
     }
 
     private void endFolderOpen(Object host) {
@@ -2088,6 +2774,62 @@ public final class ModuleMain extends XposedModule {
         folderOpenActive = false;
         Object launcher = resolveLauncher(host);
         forceDepthBlur(launcher != null ? launcher : host, 0f);
+        if (DesktopBackdropHub.isLive()) {
+            DesktopBackdropSampler.invalidateCache();
+        }
+    }
+
+    /**
+     * Tell SystemUI whether Launcher-backed ashmem is meaningful.
+     * <ul>
+     *   <li>Home + Overview/Recents → ashmem (icons or Recents cards from Launcher)</li>
+     *   <li>PAGE_PREVIEW / TOGGLE_BAR → {@code captureDisplay}</li>
+     * </ul>
+     */
+    private void syncDesktopHomeValidForLauncher(Object launcher) {
+        try {
+            boolean overview = isLauncherOverviewState(launcher);
+            LauncherAshmemMode.setOverviewActive(overview);
+            boolean ashmemOk = !isInLauncherState(launcher, "PAGE_PREVIEW")
+                    && !isInLauncherState(launcher, "TOGGLE_BAR");
+            DesktopBackdropHub.setDesktopHomeValid(ashmemOk);
+            if (DesktopBackdropHub.isLive()) {
+                DesktopBackdropSampler.invalidateCache();
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    private boolean isLauncherOverviewState(Object launcher) {
+        if (launcher == null) return false;
+        try {
+            ClassLoader cl = launcher.getClass().getClassLoader();
+            Class<?> stateClass = Class.forName("com.android.launcher3.LauncherState", false, cl);
+            Method isInState = null;
+            for (Method m : launcher.getClass().getMethods()) {
+                if ("isInState".equals(m.getName()) && m.getParameterCount() == 1) {
+                    isInState = m;
+                    break;
+                }
+            }
+            if (isInState == null) return false;
+            String[] fields = {
+                    "OVERVIEW", "OVERVIEW_MODAL_TASK", "OVERVIEW_SPLIT_SELECT", "BACKGROUND_APP"
+            };
+            for (String name : fields) {
+                Object state;
+                try {
+                    state = stateClass.getField(name).get(null);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if (state != null && Boolean.TRUE.equals(isInState.invoke(launcher, state))) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static Object resolveLauncher(Object host) {
@@ -2362,29 +3104,557 @@ public final class ModuleMain extends XposedModule {
     }
 
     /**
-     * While another item is dragged onto a folder, ColorOS hides {@code mBgView} and delegates
-     * OEM blur drawing to CellLayout. Restore the glass host and reassert LiquidGlass.
+     * Create-folder / folder-accept: OEM hides {@code mBgView} and paints via CellLayout
+     * {@code drawBackground}. Install glass for that canvas path — never force mBgView
+     * VISIBLE while delegated or while OEM hid it (that shows folder plate + canvas glass).
+     * Never {@code layout(0,0)} an attached FolderIcon plate (that shifts glass to top-left).
+     * Create-folder parks {@code mBgView} on CellLayout for capture; detach before FolderIcon
+     * takes ownership (see {@link #preparePreviewTransferToFolder}).
      */
     private void keepHoverFolderGlassVisible(Object previewBackground) {
         if (!enabled() || previewBackground == null) return;
-        Object host = field(previewBackground, "mInvalidateDelegate");
-        if (!isClassOrSubclass(host, "com.android.launcher3.folder.FolderIcon")) return;
-        if (isFolderOpen(host)) return;
+        ensurePreviewGlassInstalled(previewBackground);
+        Object folderHost = resolvePreviewFolderIcon(previewBackground);
+        if (folderHost != null && isFolderOpen(folderHost)) return;
+
         Object bgView = field(previewBackground, "mBgView");
-        if (bgView instanceof View) {
-            ((View) bgView).setVisibility(View.VISIBLE);
+        boolean delegated = isPreviewDrawingDelegated(previewBackground);
+        if (delegated) {
+            placeCreateFolderBgForCapture(previewBackground);
+            suppressOemPreviewDrawable(previewBackground);
+            // Folder accept: keep OEM-hidden plate hidden — canvas glass only.
+            if (folderHost != null && bgView instanceof View) {
+                ((View) bgView).setVisibility(View.INVISIBLE);
+            }
+            Object delegate = field(previewBackground, "mDrawingDelegate");
+            if (delegate instanceof View) ((View) delegate).invalidate();
+            Object invalidate = field(previewBackground, "mInvalidateDelegate");
+            if (invalidate instanceof View) ((View) invalidate).invalidate();
+            Object createHost = field(previewBackground, "mHostView");
+            if (createHost instanceof View) ((View) createHost).invalidate();
+            if (DesktopBackdropHub.isLive()) {
+                DesktopBackdropSampler.invalidateCache();
+            }
+            return;
         }
-        setFolderBackgroundVisibility(previewBackground, true);
-        syncFolderPreview(host, previewBackground);
-        if (bgView instanceof View) {
+
+        // animateToAccept hides mBgView before delegateDrawing runs — do not fight OEM.
+        if (bgView instanceof View && ((View) bgView).getVisibility() != View.VISIBLE) {
+            Object delegate = field(previewBackground, "mDrawingDelegate");
+            if (delegate instanceof View) ((View) delegate).invalidate();
+            return;
+        }
+
+        // Resting FolderIcon: keep attached mBgView visible with glass.
+        if (bgView instanceof View && ((View) bgView).getParent() != null
+                && folderHost != null) {
             View view = (View) bgView;
+            view.setVisibility(View.VISIBLE);
             if (GlassInstaller.get(view) != null) {
                 GlassInstaller.forceCapture(view);
                 view.invalidate();
             }
         }
-        if (host instanceof View) ((View) host).invalidate();
+        if (folderHost instanceof View) ((View) folderHost).invalidate();
     }
+
+    private static boolean isPreviewDrawingDelegated(Object previewBackground) {
+        Object delegated = invokeNoArgs(previewBackground, "drawingDelegated");
+        if (delegated instanceof Boolean) return (Boolean) delegated;
+        return field(previewBackground, "mDrawingDelegate") != null;
+    }
+
+    private static Object resolvePreviewFolderIcon(Object previewBackground) {
+        Object host = field(previewBackground, "mInvalidateDelegate");
+        if (isClassOrSubclass(host, "com.android.launcher3.folder.FolderIcon")) return host;
+        Object createHost = field(previewBackground, "mHostView");
+        if (isClassOrSubclass(createHost, "com.android.launcher3.folder.FolderIcon")) {
+            return createHost;
+        }
+        return null;
+    }
+
+    /**
+     * Install LiquidGlass on {@code OplusPreviewBackground.mBgView}. Create-folder parks the
+     * ImageView on CellLayout for correct backdrop sampling; FolderIcon plates
+     * keep OEM FrameLayout margins (never re-layout here).
+     */
+    private void ensurePreviewGlassInstalled(Object previewBackground) {
+        if (!enabled() || previewBackground == null) return;
+        Object folderHost = resolvePreviewFolderIcon(previewBackground);
+        if (folderHost != null && isFolderOpen(folderHost)) return;
+
+        Object bgView = field(previewBackground, "mBgView");
+        if (!(bgView instanceof ImageView)) {
+            try {
+                Object ctx = field(previewBackground, "mContext");
+                Object attachHost = folderHost != null ? folderHost
+                        : field(previewBackground, "mInvalidateDelegate");
+                if (ctx instanceof android.content.Context && attachHost instanceof View) {
+                    invoke(previewBackground, "initBgViewIfNeed",
+                            new Class<?>[]{android.content.Context.class, View.class},
+                            ctx, attachHost);
+                }
+            } catch (Throwable ignored) { }
+            bgView = field(previewBackground, "mBgView");
+        }
+        if (!(bgView instanceof ImageView)) {
+            bgView = createDetachedPreviewBgView(previewBackground);
+        }
+        if (!(bgView instanceof ImageView)) return;
+        ImageView image = (ImageView) bgView;
+        // FolderIcon only: ensure child exists. Never re-layout resting / accept plates here.
+        if (folderHost instanceof ViewGroup && image.getParent() == null) {
+            try {
+                ((ViewGroup) folderHost).addView(image, 0);
+                invokeSetBackground(previewBackground, folderHost);
+            } catch (Throwable ignored) { }
+        }
+        GlassInstaller.installImage(image, currentConfig());
+        applyPreviewRadius(previewBackground, image);
+        if (image.getDrawable() != null) image.setImageDrawable(null);
+        suppressOemPreviewDrawable(previewBackground);
+    }
+
+    private ImageView createDetachedPreviewBgView(Object previewBackground) {
+        try {
+            Object ctx = field(previewBackground, "mContext");
+            if (!(ctx instanceof android.content.Context)) return null;
+            float radius = 0f;
+            Object r = field(previewBackground, "mRadius");
+            if (r instanceof Number) radius = ((Number) r).floatValue();
+            Class<?> cls = Class.forName("com.android.launcher3.folder.FolderRoundImageView",
+                    false, previewBackground.getClass().getClassLoader());
+            Object created = cls.getConstructor(float.class, android.content.Context.class)
+                    .newInstance(radius, ctx);
+            if (created instanceof ImageView) {
+                setField(previewBackground, "mBgView", created);
+                return (ImageView) created;
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    /**
+     * Park create-folder {@code mBgView} on {@code CellLayout} at cell-local plate coords so
+     * {@link GlassInstaller#forceCapture} samples the same screen region CellLayout paints.
+     * DragLayer / detached {@code layout(0,0)} sampled the wrong region (top-left) and looked
+     * bright. Detach before {@code FolderIcon.setPreviewBackground} (see preparePreviewTransfer).
+     * CellLayout.onLayout only lays out ShortcutsAndWidgets, so this direct child keeps
+     * manual {@code layout()}.
+     */
+    private void placeCreateFolderBgForCapture(Object preview) {
+        if (preview == null) return;
+        if (resolvePreviewFolderIcon(preview) != null) return;
+        if (!isPreviewDrawingDelegated(preview)) return;
+        Object bgView = field(preview, "mBgView");
+        Object delegate = field(preview, "mDrawingDelegate");
+        if (!(bgView instanceof ImageView) || !(delegate instanceof ViewGroup)) return;
+        ImageView image = (ImageView) bgView;
+        ViewGroup cellLayout = (ViewGroup) delegate;
+        try {
+            if (image.getParent() != cellLayout) {
+                detachCreateFolderCaptureHost(preview);
+                cellLayout.addView(image);
+            }
+            repositionCreateFolderBgIfParked(preview);
+        } catch (Throwable ignored) {
+            cellLayout.post(() -> {
+                try {
+                    if (!isPreviewDrawingDelegated(preview)) return;
+                    placeCreateFolderBgForCapture(preview);
+                    cellLayout.invalidate();
+                } catch (Throwable ignored2) { }
+            });
+        }
+    }
+
+    /** Update capture-host layout when already parented to CellLayout (safe during onDraw). */
+    private void repositionCreateFolderBgIfParked(Object preview) {
+        if (preview == null || resolvePreviewFolderIcon(preview) != null) return;
+        Object bgView = field(preview, "mBgView");
+        Object delegate = field(preview, "mDrawingDelegate");
+        if (!(bgView instanceof ImageView) || !(delegate instanceof ViewGroup)) return;
+        ImageView image = (ImageView) bgView;
+        ViewGroup cellLayout = (ViewGroup) delegate;
+        if (image.getParent() != cellLayout) return;
+
+        Object rectObj = invokeNoArgs(preview, "getBackgroundRect");
+        if (!(rectObj instanceof android.graphics.Rect)) return;
+        android.graphics.Rect r = (android.graphics.Rect) rectObj;
+        if (r.width() <= 0 || r.height() <= 0) return;
+
+        int cellX = 0;
+        int cellY = 0;
+        Object cx = field(preview, "mDelegateCellX");
+        Object cy = field(preview, "mDelegateCellY");
+        if (cx instanceof Number) cellX = ((Number) cx).intValue();
+        if (cy instanceof Number) cellY = ((Number) cy).intValue();
+        int[] cellPoint = new int[2];
+        if (!cellToPoint(cellLayout, cellX, cellY, cellPoint)) return;
+
+        try {
+            // Same coordinate space as CellLayout.onDraw: translate(cellPoint) + getBackgroundRect.
+            image.setVisibility(View.INVISIBLE);
+            int left = cellPoint[0] + r.left;
+            int top = cellPoint[1] + r.top;
+            image.measure(
+                    View.MeasureSpec.makeMeasureSpec(r.width(), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(r.height(), View.MeasureSpec.EXACTLY));
+            image.layout(left, top, left + r.width(), top + r.height());
+            GlassDrawable glass = GlassInstaller.get(image);
+            if (glass != null) glass.setBounds(0, 0, r.width(), r.height());
+            applyPreviewRadius(preview, image);
+        } catch (Throwable ignored) { }
+    }
+
+    private static boolean cellToPoint(View cellLayout, int cellX, int cellY, int[] out) {
+        if (out == null || out.length < 2) return false;
+        for (Class<?> c = cellLayout.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                Method method = c.getDeclaredMethod("cellToPoint", int.class, int.class, int[].class);
+                method.setAccessible(true);
+                method.invoke(cellLayout, cellX, cellY, out);
+                return true;
+            } catch (Throwable ignored) { }
+        }
+        return false;
+    }
+
+    private void applyPreviewRadius(Object preview, ImageView image) {
+        GlassDrawable glass = GlassInstaller.get(image);
+        if (glass == null) return;
+        float radius = 0f;
+        Object rv = field(preview, "mRadius");
+        if (rv instanceof Number) radius = ((Number) rv).floatValue();
+        Object scale = field(preview, "mScale");
+        if (scale instanceof Number) radius *= ((Number) scale).floatValue();
+        if (radius > 0f) glass.setCornerRadii(radius, radius, radius, radius);
+    }
+
+    /**
+     * Replace OEM folder_icon_bg / LayerBlur with a transparent placeholder.
+     * {@code animateToAccept → setBlurAlpha(0)} sets {@code mDefaultAlpha=1} and would paint a
+     * bright translucent fill if the drawable remained installed.
+     */
+    private static void suppressOemPreviewDrawable(Object preview) {
+        if (preview == null) return;
+        Object current = field(preview, "mBgDrawable");
+        if (current != TRANSPARENT_PREVIEW_BG && current instanceof Drawable) {
+            SAVED_PREVIEW_OEM_BG.putIfAbsent(preview, (Drawable) current);
+            setField(preview, "mBgDrawable", TRANSPARENT_PREVIEW_BG);
+        }
+        Object bgView = field(preview, "mBgView");
+        if (bgView instanceof ImageView) {
+            ImageView image = (ImageView) bgView;
+            Drawable imageDrawable = image.getDrawable();
+            if (imageDrawable != null && !(imageDrawable instanceof GlassDrawable)
+                    && imageDrawable != TRANSPARENT_PREVIEW_BG) {
+                image.setImageDrawable(null);
+            }
+        }
+    }
+
+    private static void restoreOemPreviewDrawable(Object preview) {
+        if (preview == null) return;
+        Drawable saved = SAVED_PREVIEW_OEM_BG.remove(preview);
+        if (saved != null) setField(preview, "mBgDrawable", saved);
+    }
+
+    private static void invokeSetBackground(Object preview, Object folderHost) {
+        for (Class<?> c = preview.getClass(); c != null; c = c.getSuperclass()) {
+            for (Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals("setBackground") || m.getParameterCount() != 1) continue;
+                try {
+                    m.setAccessible(true);
+                    m.invoke(preview, folderHost);
+                    return;
+                } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    /** Detach create-folder capture host from DragLayer / CellLayout (never FolderIcon). */
+    private void detachCreateFolderCaptureHost(Object preview) {
+        if (preview == null) return;
+        if (resolvePreviewFolderIcon(preview) != null) return;
+        Object bgView = field(preview, "mBgView");
+        if (!(bgView instanceof View)) return;
+        View image = (View) bgView;
+        if (!(image.getParent() instanceof ViewGroup)) return;
+        ViewGroup parent = (ViewGroup) image.getParent();
+        String pname = parent.getClass().getSimpleName();
+        if (pname != null && pname.contains("FolderIcon")) return;
+        try {
+            parent.removeView(image);
+        } catch (Throwable ignored) { }
+    }
+
+    /** Hide + detach before OEM clearDrawingDelegate sets the CellLayout park host VISIBLE. */
+    private void hideAndDetachCreateFolderCaptureHost(Object preview) {
+        if (preview == null || resolvePreviewFolderIcon(preview) != null) return;
+        Object bgView = field(preview, "mBgView");
+        if (bgView instanceof View) {
+            try {
+                ((View) bgView).setVisibility(View.INVISIBLE);
+            } catch (Throwable ignored) { }
+        }
+        detachCreateFolderCaptureHost(preview);
+    }
+
+    /**
+     * After create-folder delegate is cleared: ensure park host is gone, glass uninstalled, and
+     * CellLayout invalidated so no residual plate remains.
+     */
+    private void finishCreateFolderPreviewCleanup(Object preview) {
+        if (preview == null) return;
+        if (resolvePreviewFolderIcon(preview) != null) return;
+        if (preview == activeCreateFolderPreview) activeCreateFolderPreview = null;
+        hideAndDetachCreateFolderCaptureHost(preview);
+        Object bgView = field(preview, "mBgView");
+        if (bgView instanceof View) {
+            View image = (View) bgView;
+            try {
+                image.setVisibility(View.INVISIBLE);
+            } catch (Throwable ignored) { }
+            if (GlassInstaller.get(image) != null) {
+                GlassInstaller.uninstall(image);
+            }
+        }
+        restoreOemPreviewDrawable(preview);
+        Object delegate = field(preview, "mDrawingDelegate");
+        if (delegate instanceof View) ((View) delegate).invalidate();
+        Object invalidate = field(preview, "mInvalidateDelegate");
+        if (invalidate instanceof View) ((View) invalidate).invalidate();
+        if (DesktopBackdropHub.isLive()) {
+            DesktopBackdropSampler.invalidateCache();
+        }
+    }
+
+    /**
+     * Cancel create-folder preview: clear CellLayout delegate drawing and detach park host.
+     * OEM onDragEnd often nulls {@code mGroupCreatePreviewBg} without clearDrawingDelegate.
+     * Move-away cancel uses animateToRest → this path must remove glass immediately.
+     */
+    private void cleanupCreateFolderPreview(Object preview) {
+        if (preview == null) return;
+        if (resolvePreviewFolderIcon(preview) != null) return;
+        hideAndDetachCreateFolderCaptureHost(preview);
+        try {
+            invokeNoArgs(preview, "clearDrawingDelegate");
+        } catch (Throwable ignored) {
+            try {
+                invoke(preview, "clearDrawingDelegate", new Class<?>[]{}, new Object[]{});
+            } catch (Throwable ignored2) { }
+        }
+        // clearDrawingDelegate hook also finishes cleanup; call again in case hook missed.
+        finishCreateFolderPreviewCleanup(preview);
+    }
+
+    /** Before FolderIcon takes ownership of the create-folder PreviewBackground. */
+    private void preparePreviewTransferToFolder(Object preview) {
+        if (preview == null) return;
+        detachCreateFolderCaptureHost(preview);
+        try {
+            invokeNoArgs(preview, "clearDrawingDelegate");
+        } catch (Throwable ignored) { }
+        restoreOemPreviewDrawable(preview);
+        Object bgView = field(preview, "mBgView");
+        if (bgView instanceof View && ((View) bgView).getParent() != null
+                && resolvePreviewFolderIcon(preview) == null) {
+            // Still parented somewhere unexpected — force detach.
+            detachCreateFolderCaptureHost(preview);
+            if (((View) bgView).getParent() instanceof ViewGroup) {
+                try {
+                    ((ViewGroup) ((View) bgView).getParent()).removeView((View) bgView);
+                } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    /**
+     * After accept ends: restore FolderIcon plate layout via OEM {@code setBackground},
+     * and detach create-folder capture host from CellLayout.
+     */
+    private void restoreFolderPreviewAfterDelegate(Object preview) {
+        if (preview == null) return;
+        Object folderHost = resolvePreviewFolderIcon(preview);
+        Object bgView = field(preview, "mBgView");
+
+        if (folderHost == null) {
+            finishCreateFolderPreviewCleanup(preview);
+            return;
+        }
+
+        if (folderHost instanceof View) {
+            View icon = (View) folderHost;
+            restoreOemPreviewDrawable(preview);
+            try {
+                Class<?> igroup = Class.forName(
+                        "com.android.launcher3.stack.view.IGroupView",
+                        false, preview.getClass().getClassLoader());
+                invoke(preview, "setBackground", new Class<?>[]{igroup}, folderHost);
+            } catch (Throwable ignored) {
+                try {
+                    invokeSetBackground(preview, folderHost);
+                } catch (Throwable ignored2) { }
+            }
+            setFolderBackgroundVisibility(preview, true);
+            syncFolderPreview(folderHost, preview);
+            icon.requestLayout();
+            icon.post(() -> {
+                setFolderBackgroundVisibility(preview, true);
+                syncFolderPreview(folderHost, preview);
+                if (bgView instanceof View) {
+                    ((View) bgView).setVisibility(View.VISIBLE);
+                    ((View) bgView).invalidate();
+                }
+                icon.invalidate();
+            });
+        }
+        if (DesktopBackdropHub.isLive()) {
+            DesktopBackdropSampler.invalidateCache();
+        }
+    }
+
+    /** Draw installed preview glass into a CellLayout delegated canvas (create-folder / accept). */
+    private boolean drawPreviewGlassOnCanvas(Object preview, Canvas canvas) {
+        if (canvas == null || preview == null) return false;
+        // After cancel / clearDrawingDelegate, never re-park or paint residual glass.
+        if (!isPreviewDrawingDelegated(preview)) return false;
+        ensurePreviewGlassInstalled(preview);
+        boolean createFolder = resolvePreviewFolderIcon(preview) == null;
+        if (createFolder) {
+            // Must be parked on CellLayout at the plate before capture — detached layout(0,0)
+            // samples screen top-left and looks bright (folder-accept path never hits this).
+            placeCreateFolderBgForCapture(preview);
+        }
+        repositionCreateFolderBgIfParked(preview);
+        suppressOemPreviewDrawable(preview);
+        Object bgView = field(preview, "mBgView");
+        if (!(bgView instanceof ImageView)) return false;
+        ImageView image = (ImageView) bgView;
+        GlassDrawable glass = GlassInstaller.get(image);
+        if (glass == null) return false;
+        Object rectObj = invokeNoArgs(preview, "getBackgroundRect");
+        if (!(rectObj instanceof android.graphics.Rect)) return false;
+        android.graphics.Rect r = (android.graphics.Rect) rectObj;
+        if (r.width() <= 0 || r.height() <= 0) return false;
+
+        if (createFolder && image.getParent() == null) {
+            // No safe capture host yet — skip rather than paint bright AGSL-fallback / wrong sample.
+            return false;
+        }
+        // FolderIcon: never image.layout(...) — that shifted plates to top-left.
+        if (!createFolder && image.getParent() == null) {
+            return false;
+        }
+        glass.setBounds(0, 0, r.width(), r.height());
+        applyPreviewRadius(preview, image);
+
+        Object folderHost = resolvePreviewFolderIcon(preview);
+        if (folderHost != null && isPreviewDrawingDelegated(preview)) {
+            image.setVisibility(View.INVISIBLE);
+        }
+
+        int save = canvas.save();
+        try {
+            canvas.translate(r.left, r.top);
+            // Skip re-entrant drawBackground while sampling — otherwise glass/fallback is baked
+            // into the backdrop and the plate looks like a bright translucent OEM tint.
+            GlassInstaller.forceCapturePreviewPlate(image);
+            // Without a backdrop frame, GlassDrawable paints a bright translucent fallback.
+            if (!GlassInstaller.hasBackdropFrame(image)) return false;
+            glass.draw(canvas);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            canvas.restoreToCount(save);
+        }
+    }
+
+    private void hookCreateFolderPreviewGlass(ClassLoader cl) {
+        // BubbleTextView / ShortcutContainer receive the shared create-folder PreviewBackground.
+        String[] hosts = {
+                "com.android.launcher3.BubbleTextView",
+                "com.android.launcher3.OplusBubbleTextView",
+                "com.android.launcher3.viewcontainer.ShortcutContainer"
+        };
+        for (String className : hosts) {
+            try {
+                Class<?> c = Class.forName(className, false, cl);
+                for (Method m : c.getDeclaredMethods()) {
+                    if (!m.getName().equals("setFolderBG") || m.isBridge() || m.isSynthetic()) {
+                        continue;
+                    }
+                    hookOnce(m, chain -> {
+                        // Read previous before OEM clears it — cancel path passes null without
+                        // always calling clearDrawingDelegate (see OplusWorkspace.onDragEnd).
+                        Object self = chain.getThisObject();
+                        Object before = field(self, "mFolderPreviewBackGround");
+                        if (before == null) before = field(self, "previewBackground");
+                        Object bg = chain.getArg(0);
+                        Object result = chain.proceed();
+                        try {
+                            if (bg == null) {
+                                cleanupCreateFolderPreview(before != null ? before : activeCreateFolderPreview);
+                            } else {
+                                activeCreateFolderPreview = bg;
+                                ensurePreviewGlassInstalled(bg);
+                                placeCreateFolderBgForCapture(bg);
+                                keepHoverFolderGlassVisible(bg);
+                            }
+                        } catch (Throwable e) {
+                            log(5, TAG, className + ".setFolderBG glass failed", e);
+                        }
+                        return result;
+                    });
+                }
+            } catch (Throwable e) {
+                log(5, TAG, "Class unavailable: " + className, e);
+            }
+        }
+
+        // Folder create reuses the create-folder PreviewBackground — must detach any temp
+        // CellLayout park before FolderIcon.addView(mBgView), else launcher crashes.
+        try {
+            Class<?> folderIcon = Class.forName("com.android.launcher3.folder.FolderIcon", false, cl);
+            for (Method m : folderIcon.getDeclaredMethods()) {
+                if (!m.getName().equals("setPreviewBackground") || m.isBridge() || m.isSynthetic()) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object preview = chain.getArg(0);
+                    try {
+                        preparePreviewTransferToFolder(preview);
+                    } catch (Throwable e) {
+                        log(5, TAG, "FolderIcon.setPreviewBackground prepare failed", e);
+                    }
+                    Object result = chain.proceed();
+                    try {
+                        Object host = chain.getThisObject();
+                        if (preview != null && host instanceof View) {
+                            activeCreateFolderPreview = null;
+                            invokeSetBackground(preview, host);
+                            setFolderBackgroundVisibility(preview, true);
+                            syncFolderPreview(host, preview);
+                            ((View) host).requestLayout();
+                            ((View) host).invalidate();
+                        }
+                    } catch (Throwable e) {
+                        log(5, TAG, "FolderIcon.setPreviewBackground glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, TAG, "FolderIcon.setPreviewBackground hook unavailable", e);
+        }
+    }
+
+    /** Shared create-folder PreviewBackground currently shown (for cancel cleanup). */
+    private volatile Object activeCreateFolderPreview;
 
     /**
      * Keeps the dragged-folder LiquidGlass backdrop in sync while the desktop pages scroll

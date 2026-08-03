@@ -88,7 +88,7 @@ fun GlassPlaygroundContent() {
         it.highlightIntensity = highlightIntensity
     }
 
-    fun restartLauncher() {
+    fun restartSystemComponents() {
         if (isRestarting) return
         isRestarting = true
         RootController.saveAndRestart(context, currentConfig()) { success, message ->
@@ -227,7 +227,7 @@ fun GlassPlaygroundContent() {
         }
 
         LiquidButton(
-            { restartLauncher() },
+            { restartSystemComponents() },
             backdrop,
             Modifier
                 .padding(horizontal = 16.dp)
@@ -236,7 +236,7 @@ fun GlassPlaygroundContent() {
             tint = Color(0xFF0088FF)
         ) {
             BasicText(
-                if (isRestarting) "正在重启…" else "重启 Launcher",
+                if (isRestarting) "正在重启…" else "重启系统组件",
                 style = TextStyle(Color.White, 14.sp)
             )
         }

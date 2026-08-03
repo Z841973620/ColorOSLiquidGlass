@@ -78,10 +78,69 @@ public final class GlassInstaller {
         BackdropCapture.clearAllOverlaySources();
     }
 
+    /**
+     * While sampling create-folder / accept plate glass, {@code CellLayout.onDraw →
+     * drawBackground} re-enters. Painting glass (or AGSL fallback) into that sample is the
+     * bright translucent plate source — callers must bracket {@link #forceCapture} with
+     * {@link #beginPreviewBackdropCapture}/{@link #endPreviewBackdropCapture}.
+     */
+    private static final ThreadLocal<Integer> PREVIEW_BACKDROP_CAPTURING =
+            ThreadLocal.withInitial(() -> 0);
+
+    public static void beginPreviewBackdropCapture() {
+        PREVIEW_BACKDROP_CAPTURING.set(PREVIEW_BACKDROP_CAPTURING.get() + 1);
+    }
+
+    public static void endPreviewBackdropCapture() {
+        PREVIEW_BACKDROP_CAPTURING.set(Math.max(0, PREVIEW_BACKDROP_CAPTURING.get() - 1));
+    }
+
+    public static boolean isPreviewBackdropCapturing() {
+        return PREVIEW_BACKDROP_CAPTURING.get() > 0;
+    }
+
+    /**
+     * While ashmem-sampling page-indicator dots for float-menu glass, skip OEM
+     * {@code drawBackgroundIfNeeded} frosted pill so only transparent dots remain.
+     */
+    private static final ThreadLocal<Integer> PAGE_INDICATOR_BG_SUPPRESS =
+            ThreadLocal.withInitial(() -> 0);
+
+    public static void beginPageIndicatorDotSample() {
+        PAGE_INDICATOR_BG_SUPPRESS.set(PAGE_INDICATOR_BG_SUPPRESS.get() + 1);
+    }
+
+    public static void endPageIndicatorDotSample() {
+        PAGE_INDICATOR_BG_SUPPRESS.set(Math.max(0, PAGE_INDICATOR_BG_SUPPRESS.get() - 1));
+    }
+
+    public static boolean suppressPageIndicatorBackground() {
+        return PAGE_INDICATOR_BG_SUPPRESS.get() > 0;
+    }
+
     /** Forces a fresh backdrop sample for a view whose size/position just changed. */
     public static void forceCapture(View view) {
         if (view == null) return;
         BackdropCapture.forceCapture(view);
+    }
+
+    /**
+     * Force-capture a folder preview plate without baking glass / AGSL-fallback into the
+     * sample (see {@link #beginPreviewBackdropCapture}).
+     */
+    public static void forceCapturePreviewPlate(View view) {
+        if (view == null) return;
+        beginPreviewBackdropCapture();
+        try {
+            BackdropCapture.forceCapture(view);
+        } finally {
+            endPreviewBackdropCapture();
+        }
+    }
+
+    /** True when a useful backdrop frame exists (avoids GlassDrawable's bright translucent fallback). */
+    public static boolean hasBackdropFrame(View view) {
+        return BackdropCapture.snapshotOf(view) != null;
     }
 
     /**
@@ -105,6 +164,7 @@ public final class GlassInstaller {
         Runnable remove = () -> {
             WeakReference<GlassDrawable> reference = INSTALLED.remove(view);
             GlassDrawable glass = reference == null ? null : reference.get();
+            BehindDisplayCapture.stopStreaming(view);
             BackdropCapture.unregister(view);
             if (glass != null && view.getBackground() == glass) {
                 view.setBackground(null);
@@ -168,6 +228,7 @@ public final class GlassInstaller {
         try {
             GlassDrawable old = get(view);
             if (old != null) {
+                old.applyConfig(config);
                 float[] liveRadii = readCornerRadii(view);
                 if (liveRadii != null) old.setCornerRadii(liveRadii);
                 else if (view.getBackground() != old) old.setCornerRadii(detectRadii(view));

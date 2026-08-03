@@ -129,7 +129,7 @@ public final class GlassDrawable extends Drawable {
             """;
 
     private final View owner;
-    private final GlassConfig config;
+    private GlassConfig config;
     private final Paint glassPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint fallbackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint highlightPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -200,7 +200,13 @@ public final class GlassDrawable extends Drawable {
         int save = canvas.save();
         canvas.clipPath(shape);
         boolean drewBackdrop = false;
-        Bitmap snapshot = backdrop == null ? null : backdrop.bitmap();
+        boolean sysUiLive = BehindDisplayCapture.isSysUiMenuGlass(owner);
+        Bitmap snapshot = sysUiLive
+                ? BehindDisplayCapture.currentFrame(owner)
+                : (backdrop == null ? null : backdrop.bitmap());
+        float[] sampleScale = sysUiLive
+                ? new float[] { 1f, 1f }
+                : (backdrop == null ? new float[] { 1f, 1f } : backdrop.sampleScale());
         if (canvas.isHardwareAccelerated() && runtimeShader != null
                 && snapshot != null && !snapshot.isRecycled()) {
             try {
@@ -216,7 +222,6 @@ public final class GlassDrawable extends Drawable {
                 runtimeShader.setInputShader("image", cachedImageShader);
                 float min = Math.max(1f, Math.min(bounds.width(), bounds.height()));
                 float[] corner = clampedRadii(bounds);
-                float[] sampleScale = backdrop.sampleScale();
                 runtimeShader.setFloatUniform("size", bounds.width(), bounds.height());
                 runtimeShader.setFloatUniform("sampleOrigin", 0f, 0f);
                 runtimeShader.setFloatUniform("sampleScale", sampleScale[0], sampleScale[1]);
@@ -283,7 +288,25 @@ public final class GlassDrawable extends Drawable {
     }
 
     private float effectiveShaderBlurRadius() {
+        // SysUI float menus: blur is applied on the DESKTOP crop worker / APP capture worker.
+        // Skip a second CPU blur on the draw thread to keep latency down.
+        if (BehindDisplayCapture.isSysUiMenuGlass(owner)) return 0f;
+        return blurRadiusPx();
+    }
+
+    /** Console {@code blur_radius} in device pixels. */
+    float blurRadiusPx() {
         return Math.max(0f, config.blurRadius) * owner.getResources().getDisplayMetrics().density;
+    }
+
+    /** Hot-update config from the module console without reinstalling the drawable. */
+    void applyConfig(GlassConfig next) {
+        if (next == null) return;
+        this.config = next;
+        recycleBlurredCache();
+        cachedImageShader = null;
+        cachedSnapshot = null;
+        invalidateSelf();
     }
 
     /**

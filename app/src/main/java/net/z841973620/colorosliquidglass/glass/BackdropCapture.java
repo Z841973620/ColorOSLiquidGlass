@@ -18,16 +18,15 @@ import java.util.Map;
 import java.util.WeakHashMap;
 
     /**
- * Captures a target-local backdrop for one Launcher folder background.
- * Capture bitmaps stay 1:1 with the glass view so backdrop detail matches screen pixels.
- * Sampling runs every frame while the glass is moving (geometry / drag / wallpaper zoom);
- * while stationary the last good frame is kept (no idle re-sample).
- * <p>
- * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
- * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
- * software-draw the hierarchy. Task-menu glass uses wallpaper + HW-rasterized thumbnails
- * (no {@code root.draw}). RapidReaction capsules sample wallpaper only.
- */
+     * Captures a target-local backdrop for one Launcher folder background.
+     * Capture bitmaps stay 1:1 with the glass view so backdrop detail matches screen pixels.
+     * Sampling runs every frame while the glass is moving (geometry / drag / wallpaper zoom);
+     * while stationary the last good frame is kept (no idle re-sample).
+     * <p>
+     * Dragged-folder glass paints wallpaper + {@link DesktopIconOverlay} without hiding
+     * {@code *DragView} (hiding flickers). Idle folder icons still hide the host and
+     * software-draw the hierarchy.
+     */
     final class BackdropCapture implements ViewTreeObserver.OnPreDrawListener,
             View.OnAttachStateChangeListener {
     private static final Map<View, BackdropCapture> CAPTURES = new WeakHashMap<>();
@@ -72,6 +71,12 @@ import java.util.WeakHashMap;
         }
         if (previous != overlay) {
             DesktopIconOverlay.clearFolderSnaps();
+            if (previous != null) TaskContentOverlay.clearProtectCache(previous);
+            if (overlay == null && previous != null) {
+                // Menu torn down — drop locked protect bake for the prior task.
+            } else if (overlay != null) {
+                TaskContentOverlay.clearProtectCache(overlay);
+            }
         }
         if (target != null) target.invalidate();
     }
@@ -96,6 +101,10 @@ import java.util.WeakHashMap;
     /** Forces an immediate target-local capture, used while resize-frame geometry is animating. */
     static void forceCapture(View target) {
         if (target == null || target.getWidth() <= 0 || target.getHeight() <= 0) return;
+        if (BehindDisplayCapture.isSysUiMenuGlass(target)) {
+            BehindDisplayCapture.requestRefresh(target, true);
+            return;
+        }
         BackdropCapture capture;
         synchronized (CAPTURES) {
             capture = CAPTURES.get(target);
@@ -174,6 +183,8 @@ import java.util.WeakHashMap;
     /** Bumps when overlay CellLayout changes so cross-page samples always publish. */
     private int dragSeedGeneration;
     private int publishedDragSeedGeneration = -1;
+    /** Task-menu open anim scales 0.9→1; track settle so we never freeze a sub-1 frame. */
+    private boolean taskMenuScaleSettling;
 
     private BackdropCapture(View target) {
         targetRef = new WeakReference<>(target);
@@ -217,8 +228,44 @@ import java.util.WeakHashMap;
             return true;
         }
 
+        // Task-menu opens with SCALE 0.9→1.0. Read prior scale before geometry update so we
+        // detect the settle frame (a ~0.99 sample must not freeze when scale hits 1.0).
+        float scaleBefore = lastHierarchyScale;
         boolean geometryChanged = updateGeometryState(target, owner, root);
         if (geometryChanged) dirty = true;
+
+        boolean taskGlass = TaskContentOverlay.isTaskView(overlaySourceOf(target));
+        if (taskGlass) {
+            float scale = cumulativeScale(owner);
+            boolean settled = scale >= 0.995f;
+            boolean wasAnimating = !Float.isNaN(scaleBefore) && scaleBefore < 0.995f;
+            if (settled && (wasAnimating || taskMenuScaleSettling)) {
+                taskMenuScaleSettling = true;
+                dirty = true;
+                skipCaptureFromSelfInvalidate = false;
+            }
+        }
+
+        // SystemUI float menus: live while open. Keep a Choreographer pump via
+        // postInvalidateOnAnimation — otherwise once the menu settles and poll returns
+        // null, traversals stop and onPreDraw never runs again (upward "freeze").
+        if (BehindDisplayCapture.isSysUiMenuGlass(target)) {
+            if (!target.isAttachedToWindow()) {
+                BehindDisplayCapture.stopStreaming(target);
+            } else {
+                BehindDisplayCapture.requestRefresh(target);
+                if (!validFrame || BehindDisplayCapture.hasNewFrame(target)
+                        || geometryChanged || dirty) {
+                    validFrame = BehindDisplayCapture.hasContent(target);
+                    BehindDisplayCapture.markPublished(target);
+                    skipCaptureFromSelfInvalidate = true;
+                    if (validFrame) target.invalidate();
+                }
+                target.postInvalidateOnAnimation();
+            }
+            dirty = false;
+            return true;
+        }
 
         // Lock / early unlock: DragLayer alpha is 0. Skip sampling so we do not overwrite a
         // good snapshot with an empty frame; stay dirty until the hierarchy is visible again.
@@ -236,7 +283,13 @@ import java.util.WeakHashMap;
 
         boolean wallpaperAnimating = WallpaperScaleTracker.isAnimating();
         boolean underDrag = dragViewAncestor(target) != null;
-        boolean moving = geometryChanged || underDrag || wallpaperAnimating;
+        // Recents task-menu glass: the app is paused when the menu opens, so the behind-menu
+        // pixels never change on their own — resample only on geometry change, never because the
+        // wallpaper is still animating (that re-renders the protect mask every frame).
+        if (taskGlass) {
+            wallpaperAnimating = false;
+        }
+        boolean moving = geometryChanged || underDrag || wallpaperAnimating || taskMenuScaleSettling;
 
         // Stationary: keep the last good frame (no idle re-sample). Still allow a one-shot
         // when there is no frame yet, or dirty was set by unlock / install / forceCapture.
@@ -244,7 +297,10 @@ import java.util.WeakHashMap;
             if (validFrame && !dirty) return true;
         }
 
-        capture(root, target, false);
+        capture(root, target, taskMenuScaleSettling || dirty);
+        if (taskMenuScaleSettling && validFrame) {
+            taskMenuScaleSettling = false;
+        }
         dirty = false;
         return true;
     }
@@ -463,8 +519,8 @@ import java.util.WeakHashMap;
                 }
                 canvas.restore();
             } else if (taskGlass) {
-                // Wallpaper already sampled in root→target space above.
-                // Task thumbnail uses glass-local matrices — reset, then blit (no root.draw).
+                // Wallpaper already sampled above. Blit task thumbnail / protect mask only —
+                // never software-draw the full launcher tree (severe frame drops).
                 canvas.restore();
                 canvas.save();
                 canvas.scale(scale, scale);
@@ -473,9 +529,23 @@ import java.util.WeakHashMap;
                 } catch (Throwable ignored) {
                 }
                 canvas.restore();
+            } else if (BehindDisplayCapture.isSysUiMenuGlass(target)) {
+                // Float/split app-options: sample composited content under the popup
+                // (exclude popup SurfaceControl) — not wallpaper alone.
+                canvas.restore();
+                canvas.save();
+                canvas.scale(scale, scale);
+                try {
+                    if (!BehindDisplayCapture.paintIntoTargetLocal(target, canvas)) {
+                        // Fallback if capture is denied — still show wallpaper plate.
+                        drawWallpaper(root, canvas);
+                    }
+                } catch (Throwable ignored) {
+                    try { drawWallpaper(root, canvas); } catch (Throwable ignored2) { }
+                }
+                canvas.restore();
             } else if (isWallpaperOnlyGlass(target)) {
                 // RapidReaction capsules sit under the live app: desktop/wallpaper only.
-                // Never software-draw the launcher tree (severe frame drops).
                 canvas.restore();
             } else {
                 View dragView = dragViewAncestor(target);
@@ -490,11 +560,15 @@ import java.util.WeakHashMap;
                 }
                 canvas.restore();
             }
+            boolean wallpaperOnly = isWallpaperOnlyGlass(target);
+            boolean behindScreen = BehindDisplayCapture.isSysUiMenuGlass(target);
             boolean seedChanged = dragGlass && seedGen != publishedDragSeedGeneration;
             complete = isMeaningful(backBitmap)
                     || (forced && !validFrame)
                     || (dragGlass && (forced || seedChanged))
-                    || (taskGlass && forced);
+                    || (taskGlass && forced)
+                    || (wallpaperOnly && forced)
+                    || (behindScreen && forced);
         } catch (Throwable ignored) {
             // Keep the previous useful frame.
         } finally {
@@ -667,7 +741,10 @@ import java.util.WeakHashMap;
         return root == null ? target : root;
     }
 
-    /** RapidReaction glass hosts are tagged {@code colg_rapid_*} and sample wallpaper only. */
+    /**
+     * Wallpaper-only hosts: RapidReaction capsules ({@code colg_rapid_*}).
+     * SystemUI float/split menus use {@link BehindDisplayCapture} instead.
+     */
     private static boolean isWallpaperOnlyGlass(View target) {
         Object tag = target == null ? null : target.getTag();
         return tag instanceof String && ((String) tag).startsWith("colg_rapid_");

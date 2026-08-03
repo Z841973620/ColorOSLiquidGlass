@@ -34,25 +34,32 @@ object RootController {
         done(true, "配置已同步")
     }
 
-    fun restartLauncher(done: (Boolean, String) -> Unit) {
+    /** Restarts both Launcher and SystemUI so Recents / float / split glass hooks reload. */
+    fun restartSystemComponents(done: (Boolean, String) -> Unit) {
         executor.execute {
             val result = runRoot(
                 "uid=\$(id -u); echo ROOT_UID=\$uid; " +
                     "if [ \"\$uid\" != \"0\" ]; then exit 126; fi; " +
                     "old_home=\$(pidof com.android.launcher); " +
-                    "echo OLD_HOME=\$old_home; " +
+                    "old_sysui=\$(pidof com.android.systemui); " +
+                    "echo OLD_HOME=\$old_home; echo OLD_SYSUI=\$old_sysui; " +
                     "[ -z \"\$old_home\" ] || kill -9 \$old_home; " +
+                    "[ -z \"\$old_sysui\" ] || kill -9 \$old_sysui; " +
                     "am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1; " +
-                    "i=0; while [ \$i -lt 40 ]; do " +
+                    "i=0; home_ok=0; sysui_ok=0; " +
+                    "while [ \$i -lt 60 ]; do " +
                     "new_home=\$(pidof com.android.launcher); " +
-                    "if [ -n \"\$new_home\" ] && [ \"\$new_home\" != \"\$old_home\" ]; then " +
-                    "echo NEW_HOME=\$new_home; exit 0; fi; " +
+                    "new_sysui=\$(pidof com.android.systemui); " +
+                    "if [ -n \"\$new_home\" ] && [ \"\$new_home\" != \"\$old_home\" ]; then home_ok=1; fi; " +
+                    "if [ -n \"\$new_sysui\" ] && [ \"\$new_sysui\" != \"\$old_sysui\" ]; then sysui_ok=1; fi; " +
+                    "if [ \$home_ok -eq 1 ] && [ \$sysui_ok -eq 1 ]; then " +
+                    "echo NEW_HOME=\$new_home; echo NEW_SYSUI=\$new_sysui; exit 0; fi; " +
                     "sleep 0.25; i=\$((i+1)); done; " +
-                    "echo RESTART_TIMEOUT HOME=\$new_home; exit 127"
+                    "echo RESTART_TIMEOUT HOME=\$new_home SYSUI=\$new_sysui home_ok=\$home_ok sysui_ok=\$sysui_ok; exit 127"
             )
             main.post {
                 if (result.code == 0 && result.output.contains("ROOT_UID=0")) {
-                    done(true, "Launcher 已重新拉起")
+                    done(true, "系统组件已重新拉起")
                 } else {
                     done(false, "Root 重启失败 (${result.code})\n${result.output.takeLast(500)}")
                 }
@@ -66,8 +73,8 @@ object RootController {
                 done(false, message)
                 return@saveConfig
             }
-            restartLauncher { restartOk, restartMessage ->
-                if (restartOk) done(true, "配置已同步，Launcher 已重新拉起")
+            restartSystemComponents { restartOk, restartMessage ->
+                if (restartOk) done(true, "配置已同步，系统组件已重新拉起")
                 else done(false, "$message\n$restartMessage")
             }
         }

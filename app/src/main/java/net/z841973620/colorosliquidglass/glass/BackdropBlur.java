@@ -9,22 +9,25 @@ import android.graphics.Bitmap;
  * AGSL, so blur must happen on that bitmap. The old AGSL 5-tap ±radius cross only echoed
  * the image and looked like ghosting.
  */
-final class BackdropBlur {
+public final class BackdropBlur {
     private BackdropBlur() {}
 
     /**
      * @param radiusPx blur radius in pixels; {@code <= 0} returns {@code src} unchanged
-     * @return a new ARGB_8888 bitmap, or {@code src} when no blur is needed
+     * @return blurred ARGB_8888 bitmap (may be {@code src} mutated in-place when mutable)
      */
-    static Bitmap blur(Bitmap src, float radiusPx) {
+    public static Bitmap blur(Bitmap src, float radiusPx) {
         if (src == null || src.isRecycled()) return src;
         int radius = Math.round(radiusPx);
         if (radius < 1) return src;
         radius = Math.min(radius, 64);
-        Bitmap bitmap = src.getConfig() == Bitmap.Config.ARGB_8888
-                ? src.copy(Bitmap.Config.ARGB_8888, true)
-                : src.copy(Bitmap.Config.ARGB_8888, true);
-        if (bitmap == null) return src;
+        Bitmap bitmap;
+        if (src.isMutable() && src.getConfig() == Bitmap.Config.ARGB_8888) {
+            bitmap = src;
+        } else {
+            bitmap = src.copy(Bitmap.Config.ARGB_8888, true);
+            if (bitmap == null) return src;
+        }
         stackBlur(bitmap, radius);
         return bitmap;
     }

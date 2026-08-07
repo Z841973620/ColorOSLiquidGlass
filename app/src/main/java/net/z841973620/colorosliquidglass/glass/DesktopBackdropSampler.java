@@ -87,8 +87,10 @@ public final class DesktopBackdropSampler {
     }
 
     public static void invalidateCache() {
+        // Dirty icons only. Clearing folder snaps here dropped LiquidGlass folder composites
+        // from float ashmem whenever CellLayout/popup laid out; after OEM-only strips live
+        // plate glass, ashmem could only rebuild empty chrome.
         iconsDirty = true;
-        DesktopIconOverlay.clearFolderSnaps();
     }
 
     /** Workspace scroll / wallpaper zoom — icons (and maybe wallpaper) must refresh. */
@@ -183,6 +185,7 @@ public final class DesktopBackdropSampler {
         if (hasLiveDragView(root)
                 || DesktopIconOverlay.hasVisibleOpenFolder(root)
                 || DesktopIconOverlay.hasDelegatedFolderPreview(root)
+                || DesktopIconOverlay.hasDesktopPopupGlass(root)
                 || overview) {
             iconsDirty = true;
         }
@@ -307,6 +310,12 @@ public final class DesktopBackdropSampler {
         } catch (Throwable t) {
             Log.w(TAG, "popup overlay paint failed", t);
         }
+        try {
+            // AGSL cannot soft-draw; HW plate + soft children (same as folder under float).
+            DesktopIconOverlay.paintDesktopPopupGlassIntoScreenRect(crop, canvas, root);
+        } catch (Throwable t) {
+            Log.w(TAG, "desktop popup glass paint failed", t);
+        }
     }
 
     /** Popup menus only — DragViews are handled by DesktopIconOverlay FastBitmap path. */
@@ -356,7 +365,10 @@ public final class DesktopBackdropSampler {
             Rect bounds = new Rect(loc[0], loc[1], loc[0] + view.getWidth(), loc[1] + view.getHeight());
             boolean huge = bounds.width() >= crop.width() * 2
                     || bounds.height() >= crop.height() * 2;
-            if (!huge && Rect.intersects(bounds, crop)) {
+            // Skip soft draw for LiquidGlass menu plates / their ancestors — SoftGlass
+            // fallback would replace AGSL. HW path paints those hosts afterward.
+            if (!huge && Rect.intersects(bounds, crop)
+                    && !DesktopIconOverlay.isOrContainsDesktopPopupGlass(view)) {
                 int save = canvas.save();
                 try {
                     canvas.translate(loc[0] - crop.left, loc[1] - crop.top);

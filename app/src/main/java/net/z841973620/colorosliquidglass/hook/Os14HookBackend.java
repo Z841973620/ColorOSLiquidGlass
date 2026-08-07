@@ -1,5 +1,7 @@
 package net.z841973620.colorosliquidglass.hook;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
@@ -70,6 +72,10 @@ public final class Os14HookBackend implements HookBackend {
         hookRecentsClearButton(cl);
         hookRecentsTaskShortcuts(cl);
         hookToggleBarChrome(cl);
+        hookToggleBarSecondLevelPreviewGlass(cl);
+        hookToggleBarApplyButtonGlass(cl);
+        hookPagePreviewItemGlass(cl);
+        hookPendingCardPreviewGlass(cl);
         hookPageIndicatorGlass(cl);
         hookUnlockGlassRefresh(cl);
         hookWallpaperScaleTracking(cl);
@@ -151,9 +157,12 @@ public final class Os14HookBackend implements HookBackend {
                         if (!enabled()) return chain.proceed();
                         Object preview = chain.getThisObject();
                         suppressOemDrawable(preview);
-                        // DragView bake: suppress white only. Create-folder CellLayout preview
-                        // must still draw canvas glass.
-                        if (folderDragActive && !isCreateFolderPreview(preview)) return null;
+                        // Only skip canvas glass for the dragged folder (DragView bake).
+                        // Sibling folders must keep drawing glass while one folder moves.
+                        if (folderDragActive && !isCreateFolderPreview(preview)
+                                && isDragSourcePreview(preview)) {
+                            return null;
+                        }
                         if (chain.getArgs().size() >= 1 && chain.getArg(0) instanceof Canvas
                                 && drawPreviewGlassOnCanvas(preview, (Canvas) chain.getArg(0))) {
                             return null;
@@ -175,8 +184,12 @@ public final class Os14HookBackend implements HookBackend {
                     Object preview = chain.getThisObject();
                     try {
                         suppressOemDrawable(preview);
-                        // DragView bake: suppress white only. Create-folder must draw glass.
-                        if (folderDragActive && !isCreateFolderPreview(preview)) return null;
+                        // DragView bake: suppress white only for the dragged folder.
+                        // Create-folder CellLayout preview must still draw glass on canvas.
+                        if (folderDragActive && !isCreateFolderPreview(preview)
+                                && isDragSourcePreview(preview)) {
+                            return null;
+                        }
                         if (drawPreviewGlassOnCanvas(preview, (Canvas) chain.getArg(0))) {
                             return null;
                         }
@@ -758,33 +771,158 @@ public final class Os14HookBackend implements HookBackend {
         }
     }
 
-    // ── Popup OEM blur suppress ─────────────────────────────────────────────
+    // ── Popup OEM blur suppress + ColorOS 14 desktop menu glass ─────────────
 
     private void hookFolderPopupBlur(ClassLoader cl) {
         final String className = "com.android.launcher3.popup.OplusPopupContainerWithArrow";
         try {
             Class<?> c = Class.forName(className, false, cl);
+            // Instance open paths. Never use method result as popup — populateAndShow
+            // returns boolean on ColorOS 14 (unlike a View return).
             for (Method m : c.getDeclaredMethods()) {
                 String name = m.getName();
                 if (m.isBridge() || m.isSynthetic()) continue;
                 if ((name.equals("reorderAndShow")
                         || name.equals("onCreateOpenAnimation")
-                        || name.equals("animateOpen")
                         || name.equals("populateAndShow")
-                        || name.equals("showEditPopupContainer")
-                        || name.equals("showForIcon"))
+                        || name.equals("showEditPopupContainer"))
                         && m.getParameterCount() <= 6) {
                     hookOnce(m, chain -> {
-                        keepPopupBlurTransparent(chain.getThisObject());
+                        Object popup = chain.getThisObject();
+                        if (enabled()) keepPopupBlurTransparent(popup);
                         Object result = chain.proceed();
-                        Object target = result != null ? result : chain.getThisObject();
-                        keepPopupBlurTransparent(target);
+                        if (enabled()) keepPopupBlurTransparent(popup);
+                        if (menuStyleEnabled()) applyDesktopPopupGlass(popup);
                         return result;
                     });
                 }
             }
+            // Static showForIcon — glass the returned popup View.
+            for (Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals("showForIcon") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (result != null && enabled()) {
+                            keepPopupBlurTransparent(result);
+                            if (menuStyleEnabled()) applyDesktopPopupGlass(result);
+                        }
+                    } catch (Throwable e) {
+                        log(5, "Os14 showForIcon popup glass failed", e);
+                    }
+                    return result;
+                });
+            }
+            // Close: reclaim glass if OEM rewrote white fills, then clean up.
+            for (Method m : c.getDeclaredMethods()) {
+                if (m.isBridge() || m.isSynthetic()) continue;
+                String name = m.getName();
+                if (!(name.equals("getOpenCloseAnimatorWithoutPendingCard")
+                        || name.equals("getOpenCloseAnimator")
+                        || name.equals("animateClose"))) continue;
+                if (name.startsWith("getOpenClose") && m.getParameterCount() < 1) continue;
+                hookOnce(m, chain -> {
+                    Object popup = chain.getThisObject();
+                    boolean opening = name.startsWith("getOpenClose")
+                            && m.getParameterCount() >= 1
+                            && Boolean.TRUE.equals(chain.getArg(0));
+                    boolean closing = name.equals("animateClose")
+                            || (name.startsWith("getOpenClose")
+                            && m.getParameterCount() >= 1
+                            && Boolean.FALSE.equals(chain.getArg(0)));
+                    Object result = chain.proceed();
+                    try {
+                        if (opening && result instanceof Animator && menuStyleEnabled()) {
+                            final Object host = popup;
+                            markDesktopPopupOpenAnimating(host, true);
+                            ((Animator) result).addListener(new AnimatorListenerAdapter() {
+                                private boolean canceled;
+
+                                @Override
+                                public void onAnimationCancel(Animator animation) {
+                                    // Pre-drag end / animator recreate may cancel; keep pumping
+                                    // so mid-release does not freeze the half-open backdrop.
+                                    canceled = true;
+                                    markDesktopPopupOpenAnimating(host, true);
+                                }
+
+                                @Override
+                                public void onAnimationEnd(Animator animation) {
+                                    if (canceled) {
+                                        canceled = false;
+                                        markDesktopPopupOpenAnimating(host, true);
+                                        return;
+                                    }
+                                    markDesktopPopupOpenAnimating(host, false);
+                                    captureDesktopPopupGlassAfterOpen(host);
+                                    if (host instanceof View) {
+                                        ((View) host).post(
+                                                () -> captureDesktopPopupGlassAfterOpen(host));
+                                    }
+                                }
+                            });
+                        }
+                        if (menuStyleEnabled() && closing) {
+                            retainDesktopPopupGlassThroughClose(popup);
+                        }
+                    } catch (Throwable e) {
+                        log(5, "Os14 " + className + "." + name + " popup glass failed", e);
+                    }
+                    return result;
+                });
+            }
+            for (Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals("closeComplete") || m.isBridge() || m.isSynthetic()) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object popup = chain.getThisObject();
+                    Object result = chain.proceed();
+                    try {
+                        finishDesktopPopupGlass(popup);
+                    } catch (Throwable e) {
+                        log(5, "Os14 closeComplete popup glass cleanup failed", e);
+                    }
+                    return result;
+                });
+            }
+            // OEM may restore opaque fills after measure/layout.
+            after(cl, className, "onLayout", popup -> {
+                if (enabled()) keepPopupBlurTransparent(popup);
+                if (menuStyleEnabled()) reassertDesktopPopupGlass(popup);
+            });
+            after(cl, "com.android.launcher3.popup.PopupContainerWithArrow", "onLayout", popup -> {
+                if (enabled()) keepPopupBlurTransparent(popup);
+                if (menuStyleEnabled()) reassertDesktopPopupGlass(popup);
+            });
         } catch (Throwable e) {
             log(5, "Os14 popup blur hook unavailable", e);
+        }
+        // animateOpen lives on ArrowPopup — filter to Oplus popup instances.
+        try {
+            Class<?> arrow = Class.forName(
+                    "com.android.launcher3.popup.ArrowPopup", false, cl);
+            for (Method m : arrow.getDeclaredMethods()) {
+                if (!m.getName().equals("animateOpen") || m.isBridge() || m.isSynthetic()) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object self = chain.getThisObject();
+                    Object result = chain.proceed();
+                    try {
+                        if (isClassOrSubclass(self,
+                                "com.android.launcher3.popup.OplusPopupContainerWithArrow")) {
+                            if (enabled()) keepPopupBlurTransparent(self);
+                            if (menuStyleEnabled()) applyDesktopPopupGlass(self);
+                        }
+                    } catch (Throwable e) {
+                        log(5, "Os14 ArrowPopup.animateOpen glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 ArrowPopup.animateOpen hook unavailable", e);
         }
         try {
             Class<?> blur = Class.forName("com.android.launcher3.popup.PopupBlurView", false, cl);
@@ -794,7 +932,10 @@ public final class Os14HookBackend implements HookBackend {
                 hookOnce(m, chain -> {
                     if (enabled() && Boolean.TRUE.equals(chain.getArg(0))) {
                         Object self = chain.getThisObject();
-                        if (self instanceof View) ((View) self).setAlpha(0f);
+                        if (self instanceof View) {
+                            ((View) self).setAlpha(0f);
+                            ((View) self).setVisibility(View.INVISIBLE);
+                        }
                         Object anim = chain.proceed();
                         if (anim instanceof android.animation.ObjectAnimator) {
                             android.animation.ObjectAnimator oa =
@@ -833,7 +974,477 @@ public final class Os14HookBackend implements HookBackend {
         if (!enabled() || popup == null) return;
         setField(popup, "mAddPopupBlurView", false);
         Object blur = field(popup, "mPopBlurView");
-        if (blur instanceof View) ((View) blur).setAlpha(0f);
+        if (blur instanceof View) {
+            ((View) blur).setAlpha(0f);
+            ((View) blur).setVisibility(View.INVISIBLE);
+        }
+    }
+
+    private static final String TAG_DESKTOP_POPUP = "colg_desktop_popup";
+
+    /**
+     * LiquidGlass on ColorOS 14 desktop long-press option panels.
+     * ColorOS 14 has no {@code mAllPopupShortcutContainer}; glass mounts on
+     * {@code mAppShortcutContainer} / {@code mSystemShortcutContainer} (and scanned panels).
+     */
+    private void applyDesktopPopupGlass(Object popup) {
+        if (!menuStyleEnabled() || !(popup instanceof ViewGroup)) return;
+        try {
+            markDesktopPopupOpenAnimating(popup, true);
+            applyDesktopPopupGlassNow(popup);
+            if (popup instanceof View) {
+                View root = (View) popup;
+                root.post(() -> {
+                    if (menuStyleEnabled() && root.isAttachedToWindow()) {
+                        reassertDesktopPopupGlass(popup);
+                    }
+                });
+                // Open scale anim ~400ms — reassert after settle in case OEM rewrote fills.
+                root.postDelayed(() -> {
+                    if (menuStyleEnabled() && root.isAttachedToWindow()) {
+                        captureDesktopPopupGlassAfterOpen(popup);
+                    }
+                }, 420L);
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 applyDesktopPopupGlass failed", e);
+        }
+    }
+
+    /** Light pass: strip restored row whites; reinstall only if OEM replaced glass. */
+    private void reassertDesktopPopupGlass(Object popup) {
+        if (!menuStyleEnabled() || !(popup instanceof ViewGroup)) return;
+        keepPopupBlurTransparent(popup);
+        clearDesktopPopupDividers((ViewGroup) popup);
+        for (View host : collectDesktopPopupPanelHosts((ViewGroup) popup)) {
+            clearDeepShortcutRowFills(host);
+            if (!(host.getBackground() instanceof GlassDrawable)) {
+                installDesktopPopupPanelGlass(host);
+            } else {
+                // Do not forceCapture on every onLayout — wallpaper-only samples can erase
+                // a good open-animation frame once the menu is fully opaque.
+                host.invalidate();
+            }
+        }
+    }
+
+    private void retainDesktopPopupGlassThroughClose(Object popup) {
+        if (!menuStyleEnabled() || !(popup instanceof ViewGroup)) return;
+        keepPopupBlurTransparent(popup);
+        clearDesktopPopupDividers((ViewGroup) popup);
+        for (View host : collectDesktopPopupPanelHosts((ViewGroup) popup)) {
+            clearDeepShortcutRowFills(host);
+            GlassDrawable glass = GlassInstaller.get(host);
+            if (glass != null) {
+                if (host.getBackground() != glass) host.setBackground(glass);
+                host.setTag(TAG_DESKTOP_POPUP);
+                host.invalidate();
+            } else {
+                installDesktopPopupPanelGlass(host);
+            }
+        }
+    }
+
+    private void finishDesktopPopupGlass(Object popup) {
+        if (!(popup instanceof ViewGroup)) return;
+        ViewGroup root = (ViewGroup) popup;
+        java.util.ArrayList<View> hosts = collectDesktopPopupPanelHosts(root);
+        for (View host : hosts) {
+            try {
+                GlassInstaller.setOverlaySource(host, null);
+                if (GlassInstaller.get(host) != null || host.getBackground() instanceof GlassDrawable) {
+                    GlassInstaller.uninstall(host);
+                }
+                if (TAG_DESKTOP_POPUP.equals(host.getTag())) host.setTag(null);
+            } catch (Throwable ignored) { }
+        }
+        uninstallNestedPopupGlass(root, new java.util.ArrayList<>());
+    }
+
+    /**
+     * After open anim ends: restore chrome only. Do <b>not</b> {@code forceCapture} —
+     * open-anim frames already have icons; settle forceCapture races OEM
+     * {@code inflateOppositeView} then 花屏 (中途松手 → 完全打开后花屏).
+     */
+    private void captureDesktopPopupGlassAfterOpen(Object popup) {
+        if (!menuStyleEnabled() || !(popup instanceof ViewGroup)) return;
+        try {
+            keepPopupBlurTransparent(popup);
+            clearDesktopPopupDividers((ViewGroup) popup);
+            for (View host : collectDesktopPopupPanelHosts((ViewGroup) popup)) {
+                clearDeepShortcutRowFills(host);
+                if (!(host.getBackground() instanceof GlassDrawable)
+                        && GlassInstaller.get(host) == null) {
+                    installDesktopPopupPanelGlass(host);
+                } else {
+                    host.invalidate();
+                }
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 captureDesktopPopupGlassAfterOpen failed", e);
+        }
+    }
+
+    private void markDesktopPopupOpenAnimating(Object popup, boolean animating) {
+        if (!(popup instanceof ViewGroup)) return;
+        ViewGroup root = (ViewGroup) popup;
+        java.util.HashSet<View> hosts = new java.util.HashSet<>(collectDesktopPopupPanelHosts(root));
+        collectTaggedDesktopPopupHosts(root, hosts);
+        for (View host : hosts) {
+            try {
+                GlassInstaller.setDesktopPopupOpenAnimating(host, animating);
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    private static void collectTaggedDesktopPopupHosts(View view, java.util.HashSet<View> out) {
+        if (view == null || out == null) return;
+        if (TAG_DESKTOP_POPUP.equals(view.getTag())) out.add(view);
+        if (view instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) view;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                collectTaggedDesktopPopupHosts(g.getChildAt(i), out);
+            }
+        }
+    }
+
+    private void applyDesktopPopupGlassNow(Object popup) {
+        if (!menuStyleEnabled() || !(popup instanceof ViewGroup)) return;
+        keepPopupBlurTransparent(popup);
+        ViewGroup root = (ViewGroup) popup;
+        clearDesktopPopupDividers(root);
+        java.util.ArrayList<View> hosts = collectDesktopPopupPanelHosts(root);
+        uninstallNestedPopupGlass(root, hosts);
+        log(4, "Os14 desktop popup glass hosts=" + hosts.size()
+                + " on " + root.getClass().getSimpleName());
+        for (View host : hosts) {
+            installDesktopPopupPanelGlass(host);
+        }
+    }
+
+    private static java.util.ArrayList<View> collectDesktopPopupPanelHosts(ViewGroup root) {
+        java.util.ArrayList<View> hosts = new java.util.ArrayList<>();
+        Object popup = root;
+        // ColorOS 16 all-container is absent on 14 — glass each shortcut panel separately.
+        addPopupPanelHost(hosts, field(popup, "mAppShortcutContainer"), root);
+        addPopupPanelHost(hosts, field(popup, "mSystemShortcutContainer"), root);
+        addPopupPanelHost(hosts, field(popup, "mDeepShortcutContainer"), root);
+        addPopupPanelHost(hosts, field(popup, "mNotificationContainer"), root);
+        collectLikelyPopupPanels(root, root, hosts);
+        // populateAndShow may leave mSystemShortcutContainer == this when only app shortcuts
+        // exist; if no child panel was found, glass the root itself when it has an OEM plate.
+        if (hosts.isEmpty() && isLikelyPopupShortcutPanel(root)) {
+            hosts.add(root);
+        }
+        return hosts;
+    }
+
+    private static void collectLikelyPopupPanels(
+            ViewGroup root, ViewGroup group, java.util.ArrayList<View> hosts) {
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child == null || child.getVisibility() != View.VISIBLE) continue;
+            if (hosts.contains(child) || isUnderAnyHost(child, hosts)) {
+                if (child instanceof ViewGroup && !hosts.contains(child)) {
+                    collectLikelyPopupPanels(root, (ViewGroup) child, hosts);
+                }
+                continue;
+            }
+            if (isLikelyPopupShortcutPanel(child)) {
+                hosts.add(child);
+                continue;
+            }
+            if (child instanceof ViewGroup) {
+                collectLikelyPopupPanels(root, (ViewGroup) child, hosts);
+            }
+        }
+    }
+
+    private static boolean isUnderAnyHost(View child, java.util.ArrayList<View> hosts) {
+        for (View host : hosts) {
+            if (host instanceof ViewGroup && isDescendantOf(child, (ViewGroup) host)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isDescendantOf(View child, ViewGroup ancestor) {
+        for (Object p = child.getParent(); p instanceof View; p = ((View) p).getParent()) {
+            if (p == ancestor) return true;
+        }
+        return false;
+    }
+
+    private static void addPopupPanelHost(
+            java.util.ArrayList<View> hosts, Object candidate, ViewGroup popupRoot) {
+        if (!(candidate instanceof View)) return;
+        View view = (View) candidate;
+        // ColorOS 14 temporarily assigns mSystemShortcutContainer = this before inflate.
+        if (view == popupRoot) return;
+        if (view.getVisibility() != View.VISIBLE) return;
+        if (!hosts.contains(view)) hosts.add(view);
+    }
+
+    private static boolean isLikelyPopupShortcutPanel(View view) {
+        if (!(view instanceof android.widget.LinearLayout)) return false;
+        String name = view.getClass().getName();
+        if (name.contains("PendingCard") || name.contains("Arrow") || name.contains("Space")
+                || name.contains("BubbleText") || name.contains("DeepShortcut")) {
+            return false;
+        }
+        Drawable bg = view.getBackground();
+        if (bg != null && !(bg instanceof GlassDrawable) && isOpaquePanelFill(bg)) return true;
+        return GlassInstaller.get(view) != null || TAG_DESKTOP_POPUP.equals(view.getTag());
+    }
+
+    private static void uninstallNestedPopupGlass(ViewGroup root, java.util.ArrayList<View> keep) {
+        uninstallNestedPopupGlassRecurse(root, keep);
+    }
+
+    private static void uninstallNestedPopupGlassRecurse(
+            ViewGroup group, java.util.ArrayList<View> keep) {
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child == null) continue;
+            if (!keep.contains(child) && (child.getBackground() instanceof GlassDrawable
+                    || GlassInstaller.get(child) != null
+                    || TAG_DESKTOP_POPUP.equals(child.getTag()))) {
+                try {
+                    GlassInstaller.setOverlaySource(child, null);
+                    GlassInstaller.uninstall(child);
+                    if (TAG_DESKTOP_POPUP.equals(child.getTag())) child.setTag(null);
+                } catch (Throwable ignored) { }
+            }
+            if (child instanceof ViewGroup) {
+                uninstallNestedPopupGlassRecurse((ViewGroup) child, keep);
+            }
+        }
+    }
+
+    private void installDesktopPopupPanelGlass(View host) {
+        if (host == null || !menuStyleEnabled()) return;
+        if (host.getAlpha() < 1f) host.setAlpha(1f);
+        clearDeepShortcutRowFills(host);
+        Runnable install = () -> {
+            if (!menuStyleEnabled() || !host.isAttachedToWindow()) return;
+            clearDeepShortcutRowFills(host);
+            float[] radii = readPopupPanelRadii(host);
+            if (radii == null && host.getBackground() instanceof GlassDrawable) {
+                try {
+                    radii = ((GlassDrawable) host.getBackground()).getCornerRadii();
+                } catch (Throwable ignored) { }
+            }
+            suppressPopupPanelOemLayer(host);
+            host.setTag(TAG_DESKTOP_POPUP);
+            View workspace = findWorkspaceNear(host);
+            if (workspace != null) {
+                GlassInstaller.setOverlaySource(host, workspace);
+            }
+            GlassInstaller.installBackground(host, currentConfig());
+            GlassDrawable glass = GlassInstaller.get(host);
+            if (glass == null) return;
+            if (radii != null) {
+                glass.setCornerRadii(radii);
+            } else {
+                float r = resolvePopupCornerFallback(host);
+                glass.setCornerRadii(r, r, r, r);
+            }
+            if (host.getWidth() <= 0 || host.getHeight() <= 0) return;
+            GlassInstaller.setDesktopPopupOpenAnimating(host, true);
+            GlassInstaller.forceCapture(host);
+            host.invalidate();
+        };
+        if (host.getWidth() > 0 && host.getHeight() > 0) {
+            install.run();
+            host.post(install);
+        } else {
+            host.post(install);
+        }
+    }
+
+    /** ColorOS 14 dimen {@code shortcut_background_radius} = 12dp. */
+    private static float resolvePopupCornerFallback(View host) {
+        try {
+            int id = host.getResources().getIdentifier(
+                    "shortcut_background_radius", "dimen", host.getContext().getPackageName());
+            if (id != 0) {
+                float dim = host.getResources().getDimension(id);
+                if (dim > 0f) return dim;
+            }
+        } catch (Throwable ignored) { }
+        return 12f * host.getResources().getDisplayMetrics().density;
+    }
+
+    private static View findWorkspaceNear(View from) {
+        for (View current = from; current != null; ) {
+            if (isClassOrSubclass(current, "com.android.launcher3.Workspace")
+                    || isClassOrSubclass(current, "com.android.launcher3.OplusWorkspace")) {
+                return current;
+            }
+            Object parent = current.getParent();
+            current = parent instanceof View ? (View) parent : null;
+        }
+        try {
+            Object launcher = resolveLauncher(from);
+            if (launcher == null) {
+                for (View current = from; current != null; ) {
+                    Object ctx = unwrapContext(current.getContext());
+                    if (ctx != null && isClassOrSubclass(ctx, "com.android.launcher3.Launcher")) {
+                        launcher = ctx;
+                        break;
+                    }
+                    Object parent = current.getParent();
+                    current = parent instanceof View ? (View) parent : null;
+                }
+            }
+            Object ws = invokeNoArgs(launcher, "getWorkspace");
+            return ws instanceof View ? (View) ws : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Object unwrapContext(Object ctx) {
+        Object cur = ctx;
+        for (int i = 0; i < 6 && cur != null; i++) {
+            if (isClassOrSubclass(cur, "com.android.launcher3.Launcher")) return cur;
+            if (cur instanceof android.content.ContextWrapper) {
+                cur = ((android.content.ContextWrapper) cur).getBaseContext();
+            } else {
+                break;
+            }
+        }
+        return ctx;
+    }
+
+    private static void clearDeepShortcutRowFills(View host) {
+        if (!(host instanceof ViewGroup)) return;
+        clearDesktopPopupDividers((ViewGroup) host);
+        ViewGroup group = (ViewGroup) host;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child == null) continue;
+            if (isDeepShortcutRow(child) || child instanceof android.widget.ScrollView
+                    || popupClassContains(child, "PopupShortcutScroll")) {
+                Drawable bg = child.getBackground();
+                if (bg != null && !(bg instanceof GlassDrawable)) {
+                    child.setBackground(null);
+                }
+            } else if (child instanceof ViewGroup
+                    && !(child instanceof ImageView)
+                    && isOpaquePanelFill(child.getBackground())) {
+                child.setBackground(null);
+            }
+            if (child instanceof ViewGroup) clearDeepShortcutRowFills(child);
+        }
+    }
+
+    private static void clearDesktopPopupDividers(ViewGroup root) {
+        if (root == null) return;
+        float density = root.getResources().getDisplayMetrics().density;
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View child = root.getChildAt(i);
+            if (child == null) continue;
+            if (child instanceof android.widget.Space) {
+                child.setVisibility(View.GONE);
+                continue;
+            }
+            String idName = null;
+            try {
+                int id = child.getId();
+                if (id != View.NO_ID) {
+                    idName = child.getResources().getResourceEntryName(id);
+                }
+            } catch (Throwable ignored) { }
+            boolean namedDivide = idName != null && (idName.contains("divider")
+                    || idName.contains("divide") || idName.contains("separator"));
+            ViewGroup.LayoutParams lp = child.getLayoutParams();
+            int lpH = lp != null ? lp.height : 0;
+            int measuredH = child.getHeight();
+            boolean thinStrip = child instanceof ImageView
+                    && ((ImageView) child).getDrawable() == null
+                    && ((measuredH > 0 && measuredH <= 8f * density)
+                    || (lpH > 0 && lpH <= 8f * density));
+            String className = child.getClass().getName();
+            boolean divideLayout = className.contains("divide") || className.contains("Divide");
+            if (namedDivide || thinStrip || divideLayout) {
+                child.setVisibility(View.GONE);
+            }
+            if (child instanceof ViewGroup) clearDesktopPopupDividers((ViewGroup) child);
+        }
+    }
+
+    private static boolean popupClassContains(View view, String token) {
+        String name = view.getClass().getName();
+        return name != null && name.contains(token);
+    }
+
+    private static boolean isOpaquePanelFill(Drawable bg) {
+        if (bg == null || bg instanceof GlassDrawable) return false;
+        String name = bg.getClass().getName();
+        if (name.contains("LayerBlur") || name.contains("BlurDrawable")) return true;
+        if (bg instanceof android.graphics.drawable.ColorDrawable) {
+            int c = ((android.graphics.drawable.ColorDrawable) bg).getColor();
+            return Color.alpha(c) > 200;
+        }
+        return bg instanceof android.graphics.drawable.GradientDrawable
+                || bg instanceof android.graphics.drawable.RippleDrawable
+                || name.contains("Smooth") || name.contains("RoundRect")
+                || name.contains("ShapeDrawable");
+    }
+
+    private static boolean isDeepShortcutRow(View view) {
+        String name = view.getClass().getName();
+        return name.contains("DeepShortcutView") || name.contains("DeepShortcut");
+    }
+
+    private static void suppressPopupPanelOemLayer(View host) {
+        Drawable bg = host.getBackground();
+        if (bg == null || bg instanceof GlassDrawable) return;
+        // Always drop OEM plate so SmoothRect / LayerDrawable whites cannot sit under glass.
+        host.setBackground(null);
+    }
+
+    private static float[] readPopupPanelRadii(View host) {
+        Drawable bg = host.getBackground();
+        if (bg instanceof android.graphics.drawable.GradientDrawable) {
+            try {
+                float[] corners = ((android.graphics.drawable.GradientDrawable) bg).getCornerRadii();
+                if (corners != null && corners.length >= 8) {
+                    return new float[] {
+                            Math.max(corners[0], corners[1]),
+                            Math.max(corners[2], corners[3]),
+                            Math.max(corners[4], corners[5]),
+                            Math.max(corners[6], corners[7])
+                    };
+                }
+                float single = ((android.graphics.drawable.GradientDrawable) bg).getCornerRadius();
+                if (single > 0f) {
+                    return new float[] { single, single, single, single };
+                }
+            } catch (Throwable ignored) { }
+        }
+        if (bg instanceof android.graphics.drawable.RippleDrawable) {
+            try {
+                android.graphics.drawable.RippleDrawable ripple =
+                        (android.graphics.drawable.RippleDrawable) bg;
+                if (ripple.getNumberOfLayers() > 0) {
+                    Drawable layer = ripple.getDrawable(0);
+                    if (layer instanceof android.graphics.drawable.GradientDrawable) {
+                        float[] corners = ((android.graphics.drawable.GradientDrawable) layer)
+                                .getCornerRadii();
+                        if (corners != null && corners.length >= 8) {
+                            return new float[] {
+                                    Math.max(corners[0], corners[1]),
+                                    Math.max(corners[2], corners[3]),
+                                    Math.max(corners[4], corners[5]),
+                                    Math.max(corners[6], corners[7])
+                            };
+                        }
+                    }
+                }
+            } catch (Throwable ignored) { }
+        }
+        return null;
     }
 
     // ── Recents clear / toggle bar / IPC (shared glass installers) ──────────
@@ -970,6 +1581,582 @@ public final class Os14HookBackend implements HookBackend {
         } catch (Throwable e) {
             log(5, "Os14 PressFeedbackHandler fill skip unavailable", e);
         }
+    }
+
+    /**
+     * ColorOS 14 「布局」/「翻页」二级预览卡：OEM 用 {@code PressFeedbackPreviewWrapper}
+     * 画实心磨砂底。装玻璃并关掉 fill，保留选中描边。
+     */
+    private void hookToggleBarSecondLevelPreviewGlass(ClassLoader cl) {
+        after(cl, "com.android.launcher.togglebar.views.ToggleBarLayoutItemPreview", "onLayout",
+                this::applyToggleBarPreviewItemGlass);
+        after(cl, "com.android.launcher.togglebar.views.ToggleBarLayoutItemPreview", "onAttachedToWindow",
+                this::applyToggleBarPreviewItemGlass);
+        after(cl, "com.android.launcher.togglebar.views.ToggleBarEffectItemContainer", "onLayout",
+                this::applyToggleBarPreviewItemGlass);
+        after(cl, "com.android.launcher.togglebar.views.ToggleBarEffectItemContainer", "onAttachedToWindow",
+                this::applyToggleBarPreviewItemGlass);
+        after(cl, "com.android.launcher.togglebar.views.TwoPanelPagepreviewItemContainer", "onLayout",
+                this::applyToggleBarPreviewItemGlass);
+        after(cl, "com.android.launcher.togglebar.views.TwoPanelPagepreviewItemContainer", "onAttachedToWindow",
+                this::applyToggleBarPreviewItemGlass);
+
+        try {
+            Class<?> layoutAdapter = Class.forName(
+                    "com.android.launcher.togglebar.adapter.ToggleBarLayoutAdapter", false, cl);
+            for (Method m : layoutAdapter.getDeclaredMethods()) {
+                if (!m.getName().equals("onBindViewHolder") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (enabled()) applyToggleBarPreviewItemGlass(field(chain.getArg(0), "itemView"));
+                    } catch (Throwable e) {
+                        log(5, "Os14 ToggleBarLayoutAdapter glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 ToggleBarLayoutAdapter unavailable", e);
+        }
+        try {
+            Class<?> effectAdapter = Class.forName(
+                    "com.android.launcher.togglebar.adapter.ToggleBarEffectAdapter", false, cl);
+            for (Method m : effectAdapter.getDeclaredMethods()) {
+                if (!m.getName().equals("onBindViewHolder") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (enabled()) applyToggleBarPreviewItemGlass(field(chain.getArg(0), "itemView"));
+                    } catch (Throwable e) {
+                        log(5, "Os14 ToggleBarEffectAdapter glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 ToggleBarEffectAdapter unavailable", e);
+        }
+
+        try {
+            Class<?> wrapper = Class.forName(
+                    "com.android.launcher.togglebar.PressFeedbackPreviewWrapper", false, cl);
+            for (Method m : wrapper.getDeclaredMethods()) {
+                if (!m.getName().equals("onDraw") || m.getParameterCount() != 1
+                        || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    if (enabled()) {
+                        Object view = field(chain.getThisObject(), "mView");
+                        if (view instanceof View && isToggleBarSecondLevelPreviewHost(view)) {
+                            setField(chain.getThisObject(), "mIsNeedDrawPressColor", false);
+                            invoke(chain.getThisObject(), "setIsNeedDrawPressColor",
+                                    new Class<?>[] { boolean.class }, false);
+                            applyToggleBarPreviewItemGlass(view);
+                        } else if (view instanceof View
+                                && isClassOrSubclass(view,
+                                "com.android.launcher.pagepreview.PagePreviewItemView")
+                                && isPagePreviewChromeActive(view)) {
+                            setField(chain.getThisObject(), "mIsNeedDrawPressColor", false);
+                            invoke(chain.getThisObject(), "setIsNeedDrawPressColor",
+                                    new Class<?>[] { boolean.class }, false);
+                            applyPagePreviewItemGlass(view);
+                        }
+                    }
+                    return chain.proceed();
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 PressFeedbackPreviewWrapper second-level glass unavailable", e);
+        }
+    }
+
+    /**
+     * ColorOS 14 二级「应用」按钮挂在 {@code toggle_bar_root} 内容里，不在 Toolbar 字段。
+     * 用 initLayoutAnimation / setDrawableColor / onAttached 多路径兜底。
+     */
+    private void hookToggleBarApplyButtonGlass(ClassLoader cl) {
+        after(cl, "com.android.launcher.togglebar.controller.ToggleBarLayoutUIController", "createView",
+                this::applySecondLevelApplyButtonGlass);
+        after(cl, "com.android.launcher.togglebar.controller.ToggleBarEffectUIController", "createView",
+                this::applySecondLevelApplyButtonGlass);
+        after(cl, "com.android.launcher.togglebar.controller.ToggleBarLayoutUIController", "resume",
+                this::applySecondLevelApplyButtonGlass);
+        after(cl, "com.android.launcher.togglebar.controller.ToggleBarEffectUIController", "resume",
+                this::applySecondLevelApplyButtonGlass);
+
+        try {
+            Class<?> rv = Class.forName(
+                    "com.android.launcher.togglebar.views.ToggleBarRecyclerView", false, cl);
+            for (Method m : rv.getDeclaredMethods()) {
+                if (!m.getName().equals("initLayoutAnimation") || m.isBridge() || m.isSynthetic()) {
+                    continue;
+                }
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (enabled() && chain.getArgs().size() >= 1) {
+                            Object btn = chain.getArg(0);
+                            if (isApplyChangeButton(btn) || isPressFeedbackButton(btn)) {
+                                // Layout/effect pass apply_change; page-preview may pass btn container.
+                                if (btn instanceof ViewGroup) {
+                                    applyPressFeedbackButtonsUnder((View) btn);
+                                } else {
+                                    applyPressFeedbackGlass(btn);
+                                }
+                            }
+                        }
+                    } catch (Throwable e) {
+                        log(5, "Os14 ToggleBarRecyclerView.initLayoutAnimation glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 ToggleBarRecyclerView.initLayoutAnimation unavailable", e);
+        }
+
+        try {
+            Class<?> btn = Class.forName("com.android.launcher.views.PressFeedbackButton", false, cl);
+            for (Method m : btn.getDeclaredMethods()) {
+                if (m.isBridge() || m.isSynthetic()) continue;
+                String name = m.getName();
+                if (!(name.equals("setDrawableColor") || name.equals("onAttachedToWindow")
+                        || name.equals("onLayout") || name.equals("setEnabled"))) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        Object self = chain.getThisObject();
+                        if (enabled() && isApplyChangeButton(self)) {
+                            applyPressFeedbackGlass(self);
+                        }
+                    } catch (Throwable e) {
+                        log(5, "Os14 PressFeedbackButton apply glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 PressFeedbackButton apply hooks unavailable", e);
+        }
+    }
+
+    private void applySecondLevelApplyButtonGlass(Object ctrl) {
+        if (!enabled() || ctrl == null) return;
+        try {
+            View apply = findViewByIdSafe(ctrl, "apply_change");
+            if (apply == null && ctrl instanceof View) {
+                apply = findApplyChangeUnder((View) ctrl);
+            }
+            if (apply == null) {
+                Object root = field(ctrl, "mRootContainerView");
+                if (root instanceof View) apply = findApplyChangeUnder((View) root);
+            }
+            if (apply == null) {
+                Object content = invokeNoArgs(ctrl, "getContentView");
+                if (content instanceof View) apply = findApplyChangeUnder((View) content);
+            }
+            if (apply != null) applyPressFeedbackGlass(apply);
+        } catch (Throwable e) {
+            log(5, "Os14 applySecondLevelApplyButtonGlass failed", e);
+        }
+    }
+
+    private static View findApplyChangeUnder(View root) {
+        if (root == null) return null;
+        if (isApplyChangeButton(root)) return root;
+        if (!(root instanceof ViewGroup)) return null;
+        ViewGroup g = (ViewGroup) root;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View found = findApplyChangeUnder(g.getChildAt(i));
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static boolean isApplyChangeButton(Object view) {
+        if (!(view instanceof View)) return false;
+        if (!isPressFeedbackButton(view)) return false;
+        try {
+            int id = ((View) view).getId();
+            if (id == View.NO_ID) return false;
+            String name = ((View) view).getResources().getResourceEntryName(id);
+            return "apply_change".equals(name);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isPressFeedbackButton(Object view) {
+        return isClassOrSubclass(view, "com.android.launcher.views.PressFeedbackButton")
+                || (view != null && view.getClass().getSimpleName().contains("PressFeedback"));
+    }
+
+    /**
+     * 选中桌面图标后底部页预览缩略图（{@code PagePreviewItemView}）。
+     * ColorOS 16 的同名逻辑在 {@code ModuleMain}；此处仅服务 Cos14。
+     */
+    private void hookPagePreviewItemGlass(ClassLoader cl) {
+        after(cl, "com.android.launcher.pagepreview.PagePreviewRoot", "onStateEnabled",
+                this::applyPagePreviewRootGlass);
+        after(cl, "com.android.launcher.pagepreview.PagePreviewRoot", "onStateTransitionEnd",
+                this::applyPagePreviewRootGlass);
+        after(cl, "com.android.launcher.pagepreview.PagePreviewRoot", "onStateDisabled",
+                this::removePagePreviewRootGlass);
+        after(cl, "com.android.launcher.pagepreview.PagePreviewRoot", "onStateDisableTransitionEnd",
+                this::removePagePreviewRootGlass);
+        after(cl, "com.android.launcher.pagepreview.PagePreviewListContainer", "onPagePreviewStateEnable",
+                this::applyPagePreviewListGlass);
+        after(cl, "com.android.launcher.pagepreview.PagePreviewListContainer", "onPagePreviewStateDisable",
+                this::removePagePreviewListGlass);
+
+        try {
+            Class<?> adapter = Class.forName(
+                    "com.android.launcher.pagepreview.PagePreviewAdapter", false, cl);
+            for (Method m : adapter.getDeclaredMethods()) {
+                if (!m.getName().equals("onBindViewHolder") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (!enabled() || !isPagePreviewChromeActive(chain.getThisObject())) {
+                            return result;
+                        }
+                        Object holder = chain.getArg(0);
+                        applyPagePreviewItemGlass(field(holder, "itemView"));
+                        applyPagePreviewItemGlass(field(holder, "mTwoPanelView1"));
+                        applyPagePreviewItemGlass(field(holder, "mTwoPanelView2"));
+                        applyPagePreviewItemGlass(invokeNoArgs(holder, "getMTwoPanelView1"));
+                        applyPagePreviewItemGlass(invokeNoArgs(holder, "getMTwoPanelView2"));
+                    } catch (Throwable e) {
+                        log(5, "Os14 PagePreviewAdapter.onBindViewHolder glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 PagePreviewAdapter glass unavailable", e);
+        }
+
+        try {
+            Class<?> preview = Class.forName(
+                    "com.android.launcher.pagepreview.PagePreviewItemView", false, cl);
+            for (Method m : preview.getDeclaredMethods()) {
+                if (m.isBridge() || m.isSynthetic()) continue;
+                String name = m.getName();
+                if (!(name.equals("onLayout") || name.equals("onAttachedToWindow")
+                        || name.equals("onDragExit"))) continue;
+                final String hooked = name;
+                hookOnce(m, chain -> {
+                    Object self = chain.getThisObject();
+                    Object result = chain.proceed();
+                    try {
+                        if ("onDragExit".equals(hooked) && self instanceof View) {
+                            GlassInstaller.uninstall((View) self);
+                        }
+                        if (enabled() && isPagePreviewChromeActive(self)) {
+                            applyPagePreviewItemGlass(self);
+                        }
+                    } catch (Throwable e) {
+                        log(5, "Os14 PagePreviewItemView." + hooked + " glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 PagePreviewItemView glass unavailable", e);
+        }
+
+        // Page-preview action buttons (移除 / 建文件夹) also use PressFeedbackButton.
+        after(cl, "com.android.launcher.pagepreview.PagePreviewButtonContainer", "onFinishInflate",
+                container -> {
+                    if (!enabled()) return;
+                    applyPressFeedbackGlass(field(container, "mRemoveBtn"));
+                    applyPressFeedbackGlass(field(container, "mFolderFormBtn"));
+                    if (container instanceof View) applyPressFeedbackButtonsUnder((View) container);
+                });
+        after(cl, "com.android.launcher.pagepreview.PagePreviewButtonContainer",
+                "onWallpaperBrightnessChanged",
+                container -> {
+                    if (!enabled()) return;
+                    applyPressFeedbackGlass(field(container, "mRemoveBtn"));
+                    applyPressFeedbackGlass(field(container, "mFolderFormBtn"));
+                });
+    }
+
+    private boolean isPagePreviewChromeActive(Object host) {
+        Object launcher = resolveLauncher(host);
+        if (launcher == null) launcher = findActiveLauncher();
+        if (launcher == null) return false;
+        return isInLauncherState(launcher, "PAGE_PREVIEW")
+                || isInLauncherState(launcher, "TOGGLE_BAR");
+    }
+
+    private void applyPagePreviewItemGlass(Object item) {
+        if (!enabled() || !(item instanceof View)) return;
+        if (!isClassOrSubclass(item, "com.android.launcher.pagepreview.PagePreviewItemView")) return;
+        if (!isPagePreviewChromeActive(item)) return;
+        final View preview = (View) item;
+        try {
+            Object wrapper = field(preview, "mPressFeedbackPreviewWrapper");
+            if (wrapper != null) {
+                setField(wrapper, "mIsNeedDrawPressColor", false);
+                invoke(wrapper, "setIsNeedDrawPressColor", new Class<?>[] { boolean.class }, false);
+            }
+            GlassDrawable existing = GlassInstaller.get(preview);
+            boolean missing = existing == null || preview.getBackground() != existing;
+            GlassInstaller.installBackground(preview, currentConfig());
+            GlassDrawable live = GlassInstaller.get(preview);
+            if (live == null) return;
+            float radius = readToggleBarPreviewRadius(preview);
+            if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
+            if (!missing) return;
+            Runnable refresh = () -> {
+                GlassDrawable g = GlassInstaller.get(preview);
+                if (g == null) return;
+                float r = readToggleBarPreviewRadius(preview);
+                if (r > 0f) g.setCornerRadii(r, r, r, r);
+                GlassInstaller.forceCapture(preview);
+                preview.invalidate();
+            };
+            if (preview.getWidth() > 0 && preview.getHeight() > 0) refresh.run();
+            else preview.post(refresh);
+        } catch (Throwable e) {
+            log(5, "Os14 applyPagePreviewItemGlass failed", e);
+        }
+    }
+
+    private void hardRemovePagePreviewItemGlass(Object item) {
+        if (!(item instanceof View)) return;
+        if (!isClassOrSubclass(item, "com.android.launcher.pagepreview.PagePreviewItemView")) return;
+        View preview = (View) item;
+        try {
+            Object wrapper = field(preview, "mPressFeedbackPreviewWrapper");
+            if (wrapper != null) {
+                setField(wrapper, "mIsNeedDrawPressColor", true);
+                invoke(wrapper, "setIsNeedDrawPressColor", new Class<?>[] { boolean.class }, true);
+            }
+            GlassInstaller.uninstall(preview);
+        } catch (Throwable e) {
+            log(5, "Os14 removePagePreviewItemGlass failed", e);
+        }
+    }
+
+    private void applyPagePreviewRootGlass(Object root) {
+        if (!enabled() || !(root instanceof View)) return;
+        applyPagePreviewItemsUnder((View) root);
+    }
+
+    private void removePagePreviewRootGlass(Object root) {
+        if (!(root instanceof View)) return;
+        hardRemovePagePreviewItemsUnder((View) root);
+    }
+
+    private void applyPagePreviewListGlass(Object list) {
+        if (!enabled() || !(list instanceof View)) return;
+        applyPagePreviewItemsUnder((View) list);
+    }
+
+    private void removePagePreviewListGlass(Object list) {
+        if (!(list instanceof View)) return;
+        hardRemovePagePreviewItemsUnder((View) list);
+    }
+
+    private void applyPagePreviewItemsUnder(View root) {
+        if (root == null) return;
+        if (isClassOrSubclass(root, "com.android.launcher.pagepreview.PagePreviewItemView")) {
+            applyPagePreviewItemGlass(root);
+            return;
+        }
+        if (!(root instanceof ViewGroup)) return;
+        ViewGroup group = (ViewGroup) root;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            applyPagePreviewItemsUnder(group.getChildAt(i));
+        }
+    }
+
+    private void hardRemovePagePreviewItemsUnder(View root) {
+        if (root == null) return;
+        if (isClassOrSubclass(root, "com.android.launcher.pagepreview.PagePreviewItemView")) {
+            hardRemovePagePreviewItemGlass(root);
+            return;
+        }
+        if (!(root instanceof ViewGroup)) return;
+        ViewGroup group = (ViewGroup) root;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            hardRemovePagePreviewItemsUnder(group.getChildAt(i));
+        }
+    }
+
+    private static boolean isToggleBarSecondLevelPreviewHost(Object view) {
+        return isClassOrSubclass(view, "com.android.launcher.togglebar.views.ToggleBarLayoutItemPreview")
+                || isClassOrSubclass(view, "com.android.launcher.togglebar.views.ToggleBarEffectItemContainer")
+                || isClassOrSubclass(view, "com.android.launcher.togglebar.views.TwoPanelPagepreviewItemContainer");
+    }
+
+    private void applyToggleBarPreviewItemGlass(Object item) {
+        if (!enabled() || !(item instanceof View)) return;
+        if (!isToggleBarSecondLevelPreviewHost(item)) return;
+        final View preview = (View) item;
+        try {
+            Object wrapper = field(preview, "mPressFeedbackPreviewWrapper");
+            if (wrapper != null) {
+                setField(wrapper, "mIsNeedDrawPressColor", false);
+                invoke(wrapper, "setIsNeedDrawPressColor", new Class<?>[] { boolean.class }, false);
+            }
+            GlassDrawable existing = GlassInstaller.get(preview);
+            boolean missing = existing == null || preview.getBackground() != existing;
+            GlassInstaller.installBackground(preview, currentConfig());
+            GlassDrawable live = GlassInstaller.get(preview);
+            if (live == null) return;
+            float radius = readToggleBarPreviewRadius(preview);
+            if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
+            if (!missing) return;
+            Runnable refresh = () -> {
+                GlassDrawable g = GlassInstaller.get(preview);
+                if (g == null) return;
+                float r = readToggleBarPreviewRadius(preview);
+                if (r > 0f) g.setCornerRadii(r, r, r, r);
+                GlassInstaller.forceCapture(preview);
+                preview.invalidate();
+            };
+            if (preview.getWidth() > 0 && preview.getHeight() > 0) refresh.run();
+            else preview.post(refresh);
+        } catch (Throwable e) {
+            log(5, "Os14 applyToggleBarPreviewItemGlass failed", e);
+        }
+    }
+
+    private static float readToggleBarPreviewRadius(View preview) {
+        Object wrapper = field(preview, "mPressFeedbackPreviewWrapper");
+        Object radius = invokeNoArgs(wrapper, "getMRadius");
+        if (radius instanceof Number && ((Number) radius).floatValue() > 0f) {
+            return ((Number) radius).floatValue();
+        }
+        Object viaField = field(wrapper, "mRadius");
+        if (viaField instanceof Number && ((Number) viaField).floatValue() > 0f) {
+            return ((Number) viaField).floatValue();
+        }
+        return 12f * preview.getResources().getDisplayMetrics().density;
+    }
+
+    private static View findViewByIdSafe(Object host, String idName) {
+        if (host == null || idName == null) return null;
+        try {
+            Object found = invoke(host, "findViewById", new Class<?>[] { int.class },
+                    resolveLauncherViewId(host, idName));
+            return found instanceof View ? (View) found : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static int resolveLauncherViewId(Object host, String idName) {
+        try {
+            ClassLoader cl = host.getClass().getClassLoader();
+            Class<?> r = Class.forName("com.android.launcher.R$id", false, cl);
+            Object v = r.getField(idName).get(null);
+            if (v instanceof Number) return ((Number) v).intValue();
+        } catch (Throwable ignored) { }
+        return 0;
+    }
+
+    /**
+     * 长按桌面图标下方的卡片预览底板（{@code card_page_bg} / pending_card_img_bg）。
+     */
+    private void hookPendingCardPreviewGlass(ClassLoader cl) {
+        after(cl, "com.android.launcher3.popup.pendingcard.PendingCardContainer", "onFinishInflate",
+                this::applyPendingCardPreviewGlass);
+        after(cl, "com.android.launcher3.popup.pendingcard.PendingCardContainer", "onAttachedToWindow",
+                this::applyPendingCardPreviewGlass);
+        after(cl, "com.android.launcher3.popup.pendingcard.PendingCardContainer", "onLayout",
+                this::applyPendingCardPreviewGlass);
+        try {
+            Class<?> container = Class.forName(
+                    "com.android.launcher3.popup.pendingcard.PendingCardContainer", false, cl);
+            for (Method m : container.getDeclaredMethods()) {
+                if (!m.getName().equals("initCardPager") || m.isBridge() || m.isSynthetic()) continue;
+                hookOnce(m, chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        if (menuStyleEnabled()) applyPendingCardPreviewGlass(chain.getThisObject());
+                    } catch (Throwable e) {
+                        log(5, "Os14 PendingCardContainer.initCardPager glass failed", e);
+                    }
+                    return result;
+                });
+            }
+        } catch (Throwable e) {
+            log(5, "Os14 PendingCardContainer.initCardPager unavailable", e);
+        }
+        // Reclaim if OEM rewrote the plate while the options popup is open.
+        after(cl, "com.android.launcher3.popup.OplusPopupContainerWithArrow", "onLayout", popup -> {
+            if (!menuStyleEnabled() || !(popup instanceof ViewGroup)) return;
+            applyPendingCardPreviewGlassUnder((ViewGroup) popup);
+        });
+    }
+
+    private void applyPendingCardPreviewGlassUnder(ViewGroup root) {
+        if (root == null) return;
+        if (isClassOrSubclass(root, "com.android.launcher3.popup.pendingcard.PendingCardContainer")) {
+            applyPendingCardPreviewGlass(root);
+            return;
+        }
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View child = root.getChildAt(i);
+            if (child instanceof ViewGroup) applyPendingCardPreviewGlassUnder((ViewGroup) child);
+        }
+    }
+
+    private void applyPendingCardPreviewGlass(Object container) {
+        if (!menuStyleEnabled() || container == null) return;
+        if (!isClassOrSubclass(container, "com.android.launcher3.popup.pendingcard.PendingCardContainer")) {
+            return;
+        }
+        try {
+            Object bg = field(container, "mPendingCardRVFourSpanXBg");
+            if (!(bg instanceof View) && container instanceof View) {
+                bg = ((View) container).findViewById(
+                        resolveLauncherViewId(container, "card_page_bg"));
+            }
+            if (!(bg instanceof View)) return;
+            final View plate = (View) bg;
+            GlassInstaller.installBackground(plate, currentConfig());
+            GlassDrawable live = GlassInstaller.get(plate);
+            if (live == null) return;
+            float radius = readPendingCardRadius(plate, container);
+            if (radius > 0f) live.setCornerRadii(radius, radius, radius, radius);
+            Runnable refresh = () -> {
+                if (!menuStyleEnabled() || !plate.isAttachedToWindow()) return;
+                GlassDrawable g = GlassInstaller.get(plate);
+                if (g == null) {
+                    GlassInstaller.installBackground(plate, currentConfig());
+                    g = GlassInstaller.get(plate);
+                }
+                if (g == null) return;
+                float r = readPendingCardRadius(plate, container);
+                if (r > 0f) g.setCornerRadii(r, r, r, r);
+                GlassInstaller.forceCapture(plate);
+                plate.invalidate();
+            };
+            if (plate.getWidth() > 0 && plate.getHeight() > 0) refresh.run();
+            else plate.post(refresh);
+            plate.postDelayed(refresh, 120L);
+        } catch (Throwable e) {
+            log(5, "Os14 applyPendingCardPreviewGlass failed", e);
+        }
+    }
+
+    private static float readPendingCardRadius(View plate, Object container) {
+        try {
+            int px = plate.getResources().getDimensionPixelSize(
+                    plate.getResources().getIdentifier(
+                            "pending_card_radius", "dimen", "com.android.launcher"));
+            if (px > 0) return px;
+        } catch (Throwable ignored) { }
+        Object via = field(container, "mRadius");
+        if (via instanceof Number && ((Number) via).floatValue() > 0f) {
+            return ((Number) via).floatValue();
+        }
+        return 24f * plate.getResources().getDisplayMetrics().density;
     }
 
     // ── Page indicator frosted pill (TOGGLE_BAR / press-drag) ───────────────
@@ -1395,7 +2582,7 @@ public final class Os14HookBackend implements HookBackend {
     }
 
     private void applyCouiPopupListGlass(Object popup) {
-        if (!enabled() || popup == null) return;
+        if (!menuStyleEnabled() || popup == null) return;
         try {
             View wrapper = asView(field(popup, "mMainMenuWrapper"));
             if (wrapper == null) wrapper = asView(field(popup, "mContentView"));
@@ -1637,11 +2824,25 @@ public final class Os14HookBackend implements HookBackend {
         }
 
         after(cl, "com.android.launcher3.dragndrop.DragController", "endDrag",
-                o -> { if (folderDragActive) endFolderDrag(o); });
+                o -> {
+                    if (folderDragActive) endFolderDrag(o);
+                    else GlassInstaller.prioritizeDesktopPopupOpenSampling();
+                });
         after(cl, "com.android.launcher3.dragndrop.DragController", "cancelDrag",
-                o -> { if (folderDragActive) endFolderDrag(o); });
+                o -> {
+                    if (folderDragActive) endFolderDrag(o);
+                    else GlassInstaller.prioritizeDesktopPopupOpenSampling();
+                });
         after(cl, "com.android.launcher3.dragndrop.OplusDragController", "endDrag",
-                o -> { if (folderDragActive) endFolderDrag(o); });
+                o -> {
+                    if (folderDragActive) endFolderDrag(o);
+                    else GlassInstaller.prioritizeDesktopPopupOpenSampling();
+                });
+        after(cl, "com.android.launcher3.dragndrop.OplusDragController", "cancelDrag",
+                o -> {
+                    if (folderDragActive) endFolderDrag(o);
+                    else GlassInstaller.prioritizeDesktopPopupOpenSampling();
+                });
     }
 
     private void installFolderDragGlass(Object dragView, Object workspace) {
@@ -1774,8 +2975,44 @@ public final class Os14HookBackend implements HookBackend {
         try {
             GlassInstaller.clearDragOverlays();
             if (source != null) syncFolderIcon(source);
+            // Sibling folders skipped canvas glass only for the drag source; re-sync all.
+            refreshWorkspaceFolderGlass(source != null ? source : host);
+            // clearDragOverlays already re-arms menu open sampling; call again after folder
+            // sync so open-anim capture wins over mid-release freeze.
+            GlassInstaller.prioritizeDesktopPopupOpenSampling();
         } catch (Throwable ignored) { }
         forceDepthBlur(host != null ? host : source, 0f);
+    }
+
+    /** True when this preview belongs to the folder currently being dragged. */
+    private boolean isDragSourcePreview(Object preview) {
+        if (preview == null || folderDragSource == null) return false;
+        Object host = resolveFolderIcon(preview);
+        return host != null && host == folderDragSource;
+    }
+
+    private void refreshWorkspaceFolderGlass(Object from) {
+        try {
+            Object launcher = resolveLauncher(from);
+            Object workspace = invokeNoArgs(launcher, "getWorkspace");
+            if (workspace instanceof ViewGroup) {
+                walkSyncFolderIcons((ViewGroup) workspace);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    private void walkSyncFolderIcons(ViewGroup group) {
+        if (group == null) return;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child == null) continue;
+            if (isFolderIcon(child)) {
+                syncFolderIcon(child);
+                child.invalidate();
+            } else if (child instanceof ViewGroup) {
+                walkSyncFolderIcons((ViewGroup) child);
+            }
+        }
     }
 
     // ── Overview 浮窗 / 分屏 / TaskMenu ──────────────────────────────────────
@@ -1935,7 +3172,7 @@ public final class Os14HookBackend implements HookBackend {
     }
 
     private void applyTaskMenuGlass(Object menu) {
-        if (!enabled() || !(menu instanceof View)) return;
+        if (!menuStyleEnabled() || !(menu instanceof View)) return;
         try {
             Object listObj = field(menu, "mListView");
             View listView = listObj instanceof View ? (View) listObj : null;
@@ -2399,6 +3636,12 @@ public final class Os14HookBackend implements HookBackend {
 
     private boolean enabled() {
         return currentConfig().enabled;
+    }
+
+    /** Master enable + 「修改菜单栏样式」 for long-press / Overview / float app menus. */
+    private boolean menuStyleEnabled() {
+        GlassConfig config = currentConfig();
+        return config.enabled && config.modifyMenuStyle;
     }
 
     private void log(int level, String msg) {

@@ -195,6 +195,9 @@ public final class GlassDrawable extends Drawable {
     }
 
     @Override public void draw(Canvas canvas) {
+        // View.drawBackground may reset bounds to the full view after setBackground.
+        // COUI submenu open grows RoundFrameLayout.f15656b — re-apply before sampling.
+        applyCouiRevealBoundsIfPresent();
         Rect bounds = getBounds();
         if (bounds.isEmpty()) return;
         int save = canvas.save();
@@ -223,7 +226,22 @@ public final class GlassDrawable extends Drawable {
                 float min = Math.max(1f, Math.min(bounds.width(), bounds.height()));
                 float[] corner = clampedRadii(bounds);
                 runtimeShader.setFloatUniform("size", bounds.width(), bounds.height());
-                runtimeShader.setFloatUniform("sampleOrigin", 0f, 0f);
+                // COUI submenu reveal sets drawable bounds to RoundFrameLayout.f15656b (a
+                // growing sub-rect) while BackdropCapture stays full-view. Offset sampling
+                // so the plate tracks the reveal; (0,0) when bounds cover the view.
+                float originX = 0f;
+                float originY = 0f;
+                if (owner != null) {
+                    int ow = owner.getWidth();
+                    int oh = owner.getHeight();
+                    if (ow > 0 && oh > 0
+                            && (bounds.left != 0 || bounds.top != 0
+                            || bounds.width() != ow || bounds.height() != oh)) {
+                        originX = bounds.left;
+                        originY = bounds.top;
+                    }
+                }
+                runtimeShader.setFloatUniform("sampleOrigin", originX, originY);
                 runtimeShader.setFloatUniform("sampleScale", sampleScale[0], sampleScale[1]);
                 // float4 must use the 4-float overload; float[] is for float array uniforms.
                 runtimeShader.setFloatUniform("cornerRadii",
@@ -270,6 +288,42 @@ public final class GlassDrawable extends Drawable {
         highlightPaint.setAlpha(Math.round(alpha * 0.16f
                 * clamp01(config.highlightIntensity) * clamp01(config.glassIntensity)));
         canvas.drawPath(shape, highlightPaint);
+    }
+
+    /**
+     * Re-apply {@code RoundFrameLayout.f15656b} after {@code View.setBackgroundBounds} forces
+     * the full view rect, so the glass plate tracks the COUI open reveal.
+     */
+    private void applyCouiRevealBoundsIfPresent() {
+        if (owner == null) return;
+        try {
+            for (Class<?> c = owner.getClass(); c != null; c = c.getSuperclass()) {
+                String name = c.getName();
+                if (name == null || !name.endsWith(".RoundFrameLayout")) continue;
+                java.lang.reflect.Field rectField;
+                try {
+                    rectField = c.getDeclaredField("f15656b");
+                } catch (NoSuchFieldException ignored) {
+                    try {
+                        rectField = c.getDeclaredField("mRevealRect");
+                    } catch (NoSuchFieldException ignored2) {
+                        return;
+                    }
+                }
+                rectField.setAccessible(true);
+                Object value = rectField.get(owner);
+                if (!(value instanceof Rect)) return;
+                Rect reveal = (Rect) value;
+                if (reveal.isEmpty()) return;
+                Rect cur = getBounds();
+                if (cur.left == reveal.left && cur.top == reveal.top
+                        && cur.right == reveal.right && cur.bottom == reveal.bottom) {
+                    return;
+                }
+                setBounds(reveal);
+                return;
+            }
+        } catch (Throwable ignored) { }
     }
 
     private float[] clampedRadii(Rect bounds) {

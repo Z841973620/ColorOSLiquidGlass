@@ -29,8 +29,8 @@ android {
         applicationId = "net.z841973620.colorosliquidglass"
         minSdk = 33
         targetSdk = 33
-        versionCode = 14
-        versionName = "1.0.0"
+        versionCode = 15
+        versionName = "1.1.0"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }

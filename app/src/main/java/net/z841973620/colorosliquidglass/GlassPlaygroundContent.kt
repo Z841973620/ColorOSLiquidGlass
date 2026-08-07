@@ -66,6 +66,7 @@ fun GlassPlaygroundContent() {
     var isSheetExpanded by remember { mutableStateOf(true) }
     var enabled by remember { mutableStateOf(initial.enabled) }
     var hideDesktopIcons by remember { mutableStateOf(initial.hideDesktopIcons) }
+    var modifyMenuStyle by remember { mutableStateOf(initial.modifyMenuStyle) }
     var glassIntensity by remember { mutableFloatStateOf(initial.glassIntensity) }
     var blurRadiusDp by remember { mutableFloatStateOf(initial.blurRadius) }
     var refractionHeightFrac by remember { mutableFloatStateOf(initial.refractionHeight) }
@@ -78,6 +79,7 @@ fun GlassPlaygroundContent() {
     fun currentConfig() = GlassConfig().also {
         it.enabled = enabled
         it.hideDesktopIcons = hideDesktopIcons
+        it.modifyMenuStyle = modifyMenuStyle
         it.glassIntensity = glassIntensity
         it.blurRadius = blurRadiusDp
         it.refractionHeight = refractionHeightFrac
@@ -186,6 +188,10 @@ fun GlassPlaygroundContent() {
                     PlaygroundToggle("隐藏桌面图标", { hideDesktopIcons }, sheetBackdrop) {
                         hideDesktopIcons = it
                         LauncherIconController.applyHideDesktopIcons(context, it)
+                        RootController.saveConfig(context, currentConfig()) { _, _ -> }
+                    }
+                    PlaygroundToggle("修改菜单栏样式", { modifyMenuStyle }, sheetBackdrop) {
+                        modifyMenuStyle = it
                         RootController.saveConfig(context, currentConfig()) { _, _ -> }
                     }
                     PlaygroundSlider("液态玻璃强度", { glassIntensity }, 0f..1f, 0.001f, sheetBackdrop) { glassIntensity = it }

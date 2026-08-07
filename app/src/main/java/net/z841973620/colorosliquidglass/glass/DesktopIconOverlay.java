@@ -15,6 +15,8 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.widget.TextView;
 
+import net.z841973620.colorosliquidglass.hook.ColorOsVersion;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -37,6 +39,8 @@ final class DesktopIconOverlay {
             ThreadLocal.withInitial(() -> 0);
     private static final Map<View, FolderSnap> FOLDER_SNAPS = new WeakHashMap<>();
     private static final Map<View, WidgetSnap> WIDGET_SNAPS = new WeakHashMap<>();
+    /** HW snap of BubbleTextView / ShortcutContainer (icon + 角标 + label). */
+    private static final Map<View, AppSnap> APP_SNAPS = new WeakHashMap<>();
 
     private static final class FolderSnap {
         Bitmap bitmap;
@@ -44,6 +48,8 @@ final class DesktopIconOverlay {
         int width;
         int height;
         boolean includeName;
+        /** Cos14 options-menu: true once AGSL plate was baked with a real backdrop. */
+        boolean popupGlassReady;
     }
 
     private static final class WidgetSnap {
@@ -52,30 +58,88 @@ final class DesktopIconOverlay {
         int height;
     }
 
+    private static final class AppSnap {
+        Bitmap bitmap;
+        int width;
+        int height;
+    }
+
     private DesktopIconOverlay() {}
 
     /**
-     * Software backdrop path for an <em>active</em> dragged-folder glass only.
-     * After finger-up the FolderIcon may keep a leftover overlay seed while no longer
-     * under a DragView; painting then would secondary-refract the desktop into the
-     * folder's own plate. Require a live *DragView ancestor (OEM: OplusDragView etc.).
+     * Software backdrop path for moving-folder glass ({@code *DragView}) and long-press
+     * options-menu plates ({@code colg_desktop_popup}). Both use
+     * {@link #paintDesktopBehindHost}.
      * <p>
      * Page-indicator dots live in the horizontal strip between Workspace and Hotseat.
      * A folder sitting entirely on that strip intersects neither icon container — still
      * paint the dots (do not early-return when containers are empty).
+     * @return true if at least one desktop item was painted
      */
-    static void paintIntoTargetLocal(View glassHost, Canvas canvas) {
-        if (glassHost == null || canvas == null) return;
-        if (findDragView(glassHost) == null) return;
+    static boolean paintIntoTargetLocal(View glassHost, Canvas canvas) {
+        if (glassHost == null || canvas == null) return false;
+        boolean drag = findDragView(glassHost) != null;
+        boolean popup = "colg_desktop_popup".equals(glassHost.getTag());
+        if (!drag && !popup) return false;
+        return paintDesktopBehindHost(glassHost, canvas);
+    }
+
+    /**
+     * Desktop icons/folders under glass in target-local space (moving folder / options menu).
+     * @return true if at least one desktop item was painted into the sample
+     */
+    static boolean paintDesktopBehindHost(View glassHost, Canvas canvas) {
+        if (glassHost == null || canvas == null) return false;
         View seed = BackdropCapture.overlaySourceOf(glassHost);
         Matrix targetToGlobal = new Matrix();
         glassHost.transformMatrixToGlobal(targetToGlobal);
         Matrix globalToTarget = new Matrix();
-        if (!targetToGlobal.invert(globalToTarget)) return;
+        if (!targetToGlobal.invert(globalToTarget)) {
+            // Singular while open-anim scale≈0 — fall back to window translate.
+            globalToTarget.reset();
+            int[] loc = new int[2];
+            glassHost.getLocationInWindow(loc);
+            globalToTarget.setTranslate(-loc[0], -loc[1]);
+        }
         RectF region = screenRect(glassHost);
-        if (region == null) return;
-        paintDesktopInto(seed != null ? seed : glassHost, canvas, globalToTarget, region, glassHost,
-                null, null);
+        if (region == null) return false;
+        // Never fall back to the popup itself — it is a DragLayer sibling of Workspace, so
+        // iconContainersUnderRegion(popup) finds no desktop cells (wallpaper-only settle).
+        View anchor = seed != null ? seed : resolveWorkspaceSeed();
+        if (anchor == null) return false;
+        boolean popup = "colg_desktop_popup".equals(glassHost.getTag());
+        View root = anchor.getRootView() != null ? anchor.getRootView() : anchor;
+        // Mid-release: DragView may still be canceling — skip origin ghosts and paint the
+        // live DragView like the float-menu path so resample keeps publishing icons.
+        java.util.HashSet<View> skipIcons = null;
+        if (popup) {
+            skipIcons = new java.util.HashSet<>();
+            collectDragSources(root, skipIcons);
+            collectDragControllerSources(anchor, skipIcons);
+        }
+        // Drag glass only: accept/create plates are CellLayout-delegated. Never run this
+        // while sampling options-menu glass — forceCapturePreviewPlate nests into live
+        // folder plates and poisons FOLDER_SNAPS (folder menu → later app menu 花屏).
+        if (!popup) {
+            paintDelegatedFolderPreviews(anchor, canvas, globalToTarget, region);
+        }
+        View skipHost = findDragView(glassHost) != null ? glassHost : null;
+        int painted = paintDesktopInto(anchor, canvas, globalToTarget, region, skipHost,
+                skipIcons, null, popup);
+        boolean underPopup = false;
+        if (popup) {
+            paintDragViewsInto(root, canvas, globalToTarget, region);
+            // Cos16 More-functions submenu only. Cos14 mounts several colg_desktop_popup
+            // panels; refracting siblings forceCaptures them mid-sample → PopupScaleSnapshot
+            // normalizes the shared OplusPopupContainerWithArrow scale and kills open anim.
+            if (BackdropCapture.isMoreFunctionsSubMenuActive()) {
+                underPopup = paintOtherDesktopPopupGlass(root, glassHost, canvas, globalToTarget,
+                        region);
+            }
+            // DragView alone under the menu still counts as a valid icon frame.
+            if (painted == 0 && hasLiveDragView(root)) return true;
+        }
+        return painted > 0 || underPopup;
     }
 
     /**
@@ -106,9 +170,329 @@ final class DesktopIconOverlay {
         // drag ends — cancel move-out restores those icons.
         RectF folderDropCover = folderDropIconCover(openFolder, root);
         paintDelegatedFolderPreviews(anchor, canvas, globalToTarget, region);
-        paintDesktopInto(anchor, canvas, globalToTarget, region, null, skipIcons, folderDropCover);
+        // HW-snap apps (cached) so ColorOS onDraw/ViewOverlay 角标 appear under float glass —
+        // FastBitmap alone omits badges. Same path as options-menu backdrop sampling.
+        paintDesktopInto(anchor, canvas, globalToTarget, region, null, skipIcons, folderDropCover,
+                true);
         paintOpenFolders(anchor, canvas, globalToTarget, region);
         paintDragViewsInto(root, canvas, globalToTarget, region);
+    }
+
+    /** True when a desktop options-menu LiquidGlass host is live (force ashmem rebuild). */
+    static boolean hasDesktopPopupGlass(View seed) {
+        View root = seed != null
+                ? (seed.getRootView() != null ? seed.getRootView() : seed)
+                : null;
+        return findDesktopPopupGlass(root) != null;
+    }
+
+    private static View findDesktopPopupGlass(View view) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return null;
+        if ("colg_desktop_popup".equals(view.getTag())
+                && view.getWidth() > 0 && view.getHeight() > 0
+                && GlassInstaller.get(view) != null) {
+            return view;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) view;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View found = findDesktopPopupGlass(g.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Float-menu ashmem: HW-rasterize {@code colg_desktop_popup} LiquidGlass plates.
+     * Soft {@code view.draw} cannot run AGSL ({@link GlassDrawable} falls back to a faint
+     * fill), so options-menu glass vanished under float glass.
+     */
+    static void paintDesktopPopupGlassIntoScreenRect(Rect screenRect, Canvas canvas) {
+        paintDesktopPopupGlassIntoScreenRect(screenRect, canvas, null);
+    }
+
+    static void paintDesktopPopupGlassIntoScreenRect(Rect screenRect, Canvas canvas, View seedRoot) {
+        if (screenRect == null || screenRect.isEmpty() || canvas == null) return;
+        View root = seedRoot;
+        if (root == null) {
+            View seed = resolveWorkspaceSeed();
+            root = seed != null && seed.getRootView() != null ? seed.getRootView() : seed;
+        } else if (root.getRootView() != null) {
+            root = root.getRootView();
+        }
+        if (root == null) return;
+        collectAndPaintDesktopPopupGlass(root, screenRect, canvas);
+    }
+
+    private static void collectAndPaintDesktopPopupGlass(View view, Rect crop, Canvas canvas) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return;
+        if ("colg_desktop_popup".equals(view.getTag())
+                && view.getWidth() > 0 && view.getHeight() > 0
+                && GlassInstaller.get(view) != null) {
+            paintOneDesktopPopupGlass(view, crop, canvas);
+            return; // children painted inside paintOneDesktopPopupGlass
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) view;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                collectAndPaintDesktopPopupGlass(g.getChildAt(i), crop, canvas);
+            }
+        }
+    }
+
+    /**
+     * Paint other {@code colg_desktop_popup} plates under {@code skipHost} (e.g. primary
+     * options menu under More-functions submenu glass). Submenu lives in a PopupWindow, so
+     * walking the launcher root finds the primary plate and never the self host.
+     */
+    private static boolean paintOtherDesktopPopupGlass(View view, View skipHost, Canvas canvas,
+            Matrix globalToTarget, RectF region) {
+        if (view == null || view.getVisibility() != View.VISIBLE || canvas == null) return false;
+        if ("colg_desktop_popup".equals(view.getTag())
+                && view != skipHost
+                && !isDescendant(view, skipHost)
+                && !isDescendant(skipHost, view)
+                && view.getWidth() > 0 && view.getHeight() > 0
+                && GlassInstaller.get(view) != null
+                && intersectsRegion(region, view)) {
+            paintOneDesktopPopupGlassIntoTarget(view, canvas, globalToTarget);
+            return true;
+        }
+        boolean painted = false;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                if (paintOtherDesktopPopupGlass(group.getChildAt(i), skipHost, canvas,
+                        globalToTarget, region)) {
+                    painted = true;
+                }
+            }
+        }
+        return painted;
+    }
+
+    /**
+     * HW-rasterize a primary options-menu LiquidGlass plate into another popup's
+     * target-local backdrop sample (submenu refraction).
+     */
+    private static void paintOneDesktopPopupGlassIntoTarget(View host, Canvas canvas,
+            Matrix globalToTarget) {
+        int w = host.getWidth();
+        int h = host.getHeight();
+        if (w <= 0 || h <= 0 || canvas == null || globalToTarget == null) return;
+        try {
+            if (!GlassInstaller.hasBackdropFrame(host)) {
+                GlassInstaller.forceCapture(host);
+            }
+        } catch (Throwable ignored) { }
+
+        GlassDrawable glass = GlassInstaller.get(host);
+        if (glass == null) return;
+
+        Matrix hostToGlobal = new Matrix();
+        host.transformMatrixToGlobal(hostToGlobal);
+        Matrix hostToTarget = new Matrix();
+        hostToTarget.setConcat(globalToTarget, hostToGlobal);
+        RectF dest = new RectF(0f, 0f, w, h);
+        hostToTarget.mapRect(dest);
+        float alpha = effectiveDrawAlpha(host);
+        if (alpha <= 0.01f) return;
+
+        Bitmap plate = null;
+        try {
+            final int pw = w;
+            final int ph = h;
+            plate = GlassHwRasterizer.render(pw, ph, hwCanvas -> {
+                DEPTH.set(DEPTH.get() + 1);
+                try {
+                    Rect old = new Rect(glass.getBounds());
+                    glass.setBounds(0, 0, pw, ph);
+                    try {
+                        glass.draw(hwCanvas);
+                    } finally {
+                        glass.setBounds(old);
+                    }
+                } finally {
+                    DEPTH.set(Math.max(0, DEPTH.get() - 1));
+                }
+            });
+            BITMAP_PAINT.setAlpha(Math.round(255f * Math.min(1f, alpha)));
+            if (plate != null && !plate.isRecycled() && !isMostlyEmpty(plate)) {
+                canvas.drawBitmap(plate, null, dest, BITMAP_PAINT);
+            } else {
+                Bitmap snap = BackdropCapture.snapshotOf(host);
+                if (snap != null && !snap.isRecycled()) {
+                    int save = canvas.save();
+                    try {
+                        canvas.clipRect(dest);
+                        canvas.drawBitmap(snap, null, dest, BITMAP_PAINT);
+                    } finally {
+                        canvas.restoreToCount(save);
+                    }
+                }
+            }
+            BITMAP_PAINT.setAlpha(255);
+        } finally {
+            if (plate != null && !plate.isRecycled()) plate.recycle();
+        }
+
+        // Draw shortcut rows only — never null the live GlassDrawable. Submenu open-anim
+        // pumps this every frame; setBackground(null) flickered / hid on-screen options.
+        try {
+            int save = canvas.save();
+            try {
+                canvas.concat(hostToTarget);
+                if (alpha < 0.99f) {
+                    canvas.saveLayerAlpha(0f, 0f, w, h, Math.round(255f * Math.min(1f, alpha)));
+                }
+                if (host instanceof ViewGroup) {
+                    ViewGroup group = (ViewGroup) host;
+                    for (int i = 0; i < group.getChildCount(); i++) {
+                        View child = group.getChildAt(i);
+                        if (child == null || child.getVisibility() != View.VISIBLE) continue;
+                        int csave = canvas.save();
+                        try {
+                            canvas.translate(child.getLeft(), child.getTop());
+                            child.draw(canvas);
+                        } catch (Throwable ignored) {
+                        } finally {
+                            canvas.restoreToCount(csave);
+                        }
+                    }
+                }
+            } finally {
+                canvas.restoreToCount(save);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Multiply view + ancestor alphas (OEM dims primary menu to ~0.6 under submenu). */
+    private static float effectiveDrawAlpha(View view) {
+        float alpha = 1f;
+        for (View current = view; current != null; ) {
+            alpha *= current.getAlpha();
+            if (alpha <= 0.01f) return 0f;
+            ViewParent parent = current.getParent();
+            if (!(parent instanceof View)) break;
+            current = (View) parent;
+        }
+        return Math.min(1f, alpha);
+    }
+
+    /**
+     * Same strategy as selected-folder glass under float: HW-rasterize {@link GlassDrawable}
+     * alone (AGSL), then software-draw children (labels/icons) on top. Full {@code host.draw}
+     * often fails to land AGSL into ashmem while SoftGlass fallback looks like “no glass”.
+     */
+    private static void paintOneDesktopPopupGlass(View host, Rect crop, Canvas canvas) {
+        int[] loc = new int[2];
+        host.getLocationOnScreen(loc);
+        int w = host.getWidth();
+        int h = host.getHeight();
+        if (w <= 0 || h <= 0) return;
+        Rect bounds = new Rect(loc[0], loc[1], loc[0] + w, loc[1] + h);
+        if (!Rect.intersects(bounds, crop)) return;
+        try {
+            if (!GlassInstaller.hasBackdropFrame(host)) {
+                GlassInstaller.forceCapture(host);
+            }
+        } catch (Throwable ignored) { }
+
+        GlassDrawable glass = GlassInstaller.get(host);
+        if (glass == null) return;
+        RectF dest = new RectF(loc[0] - crop.left, loc[1] - crop.top,
+                loc[0] - crop.left + w, loc[1] - crop.top + h);
+
+        Bitmap plate = null;
+        try {
+            final int pw = w;
+            final int ph = h;
+            plate = GlassHwRasterizer.render(pw, ph, hwCanvas -> {
+                DEPTH.set(DEPTH.get() + 1);
+                try {
+                    Rect old = new Rect(glass.getBounds());
+                    glass.setBounds(0, 0, pw, ph);
+                    try {
+                        glass.draw(hwCanvas);
+                    } finally {
+                        glass.setBounds(old);
+                    }
+                } finally {
+                    DEPTH.set(Math.max(0, DEPTH.get() - 1));
+                }
+            });
+            if (plate != null && !plate.isRecycled() && !isMostlyEmpty(plate)) {
+                BITMAP_PAINT.setAlpha(255);
+                canvas.drawBitmap(plate, null, dest, BITMAP_PAINT);
+            } else {
+                // Backdrop lag: still paint a readable plate from the last snapshot if any.
+                Bitmap snap = BackdropCapture.snapshotOf(host);
+                if (snap != null && !snap.isRecycled()) {
+                    int save = canvas.save();
+                    try {
+                        canvas.clipRect(dest);
+                        canvas.drawBitmap(snap, null, dest, BITMAP_PAINT);
+                    } finally {
+                        canvas.restoreToCount(save);
+                    }
+                }
+            }
+        } finally {
+            if (plate != null && !plate.isRecycled()) plate.recycle();
+        }
+
+        // Menu labels / shortcut rows — software draw with glass background suppressed so
+        // SoftGlass fallback cannot cover the HW plate.
+        Drawable previousBg = host.getBackground();
+        try {
+            host.setBackground(null);
+            int save = canvas.save();
+            try {
+                canvas.translate(dest.left, dest.top);
+                float sx = dest.width() / Math.max(1f, w);
+                float sy = dest.height() / Math.max(1f, h);
+                if (Math.abs(sx - 1f) > 0.01f || Math.abs(sy - 1f) > 0.01f) {
+                    canvas.scale(sx, sy);
+                }
+                if (host instanceof ViewGroup) {
+                    ViewGroup group = (ViewGroup) host;
+                    for (int i = 0; i < group.getChildCount(); i++) {
+                        View child = group.getChildAt(i);
+                        if (child == null || child.getVisibility() != View.VISIBLE) continue;
+                        int csave = canvas.save();
+                        try {
+                            canvas.translate(child.getLeft(), child.getTop());
+                            child.draw(canvas);
+                        } catch (Throwable ignored) {
+                        } finally {
+                            canvas.restoreToCount(csave);
+                        }
+                    }
+                }
+            } finally {
+                canvas.restoreToCount(save);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try { host.setBackground(previousBg); } catch (Throwable ignored) { }
+        }
+    }
+
+    /** True when this view is or contains a {@code colg_desktop_popup} LiquidGlass host. */
+    static boolean isOrContainsDesktopPopupGlass(View view) {
+        if (view == null) return false;
+        if ("colg_desktop_popup".equals(view.getTag()) && GlassInstaller.get(view) != null) {
+            return true;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) view;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (isOrContainsDesktopPopupGlass(g.getChildAt(i))) return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -170,8 +554,8 @@ final class DesktopIconOverlay {
             if (glass == null) return;
         }
 
-        // Dest must match the capture host when parked; otherwise cell math vs stale mBgView
-        // location skews the plate (typically downward) inside float-menu glass.
+        // Dest must match CellLayout delegated plate (accept canvas). Mapping via FolderIcon
+        // alone skews an accept-scaled plate toward bottom-right under drag glass.
         RectF dest = plateDestOnScreen(bgView, cellLayout, cellPoint, bg);
         if (dest == null || !RectF.intersects(region, dest)) return;
         globalToTarget.mapRect(dest);
@@ -689,25 +1073,78 @@ final class DesktopIconOverlay {
         return new float[]{x, y};
     }
 
-    /** Folder accept: map PreviewItemManager glyphs into the scaled CellLayout plate dest. */
+    /**
+     * Folder accept: paint PreviewItemManager glyphs into {@code plateDest}.
+     * Cos16 {@code transX/Y} are FolderIcon-space and already include basePreviewOffset;
+     * plateDest is the live {@code getBackgroundRect} (offset shifts while accept-scaled).
+     * Map with OEM draw under a FolderIcon→plate transform so glyphs stay aligned.
+     */
     private static void paintFolderPreviewIconsIntoPlate(View folderIcon, RectF plateDest,
             Canvas canvas) {
         if (folderIcon == null || plateDest == null) return;
         Object manager = fieldValue(folderIcon, "mPreviewItemManager");
         if (manager == null) return;
-        Object paramsObj = invokeNoArgs(manager, "getCurrentPageParams");
-        if (!(paramsObj instanceof List)) return;
-        List<?> params = (List<?>) paramsObj;
+        Object background = fieldValue(folderIcon, "mBackground");
+        float originX = floatField(background, "basePreviewOffsetX");
+        float originY = floatField(background, "basePreviewOffsetY");
+        float srcW = 0f;
+        float srcH = 0f;
+        Object rectObj = invokeNoArgs(background, "getBackgroundRect");
+        if (rectObj instanceof Rect) {
+            Rect bg = (Rect) rectObj;
+            if (bg.width() > 0 && bg.height() > 0) {
+                // Accept grow centers the plate via getOffsetX/Y — use that as glyph space origin.
+                originX = bg.left;
+                originY = bg.top;
+                srcW = bg.width();
+                srcH = bg.height();
+            }
+        }
+        if (srcW <= 0f || srcH <= 0f) {
+            Object previewW = fieldValue(background, "mPreviewSizeX");
+            Object previewH = fieldValue(background, "mPreviewSizeY");
+            if (previewW instanceof Number) srcW = ((Number) previewW).floatValue();
+            if (previewH instanceof Number) srcH = ((Number) previewH).floatValue();
+        }
+        if (srcW <= 0f || srcH <= 0f) {
+            Object ps = fieldValue(background, "previewSize");
+            if (ps instanceof Number) {
+                float s = ((Number) ps).floatValue();
+                if (srcW <= 0f) srcW = s;
+                if (srcH <= 0f) srcH = s;
+            }
+        }
+        if (srcW <= 0f || srcH <= 0f) {
+            Rect plateLocal = folderPlateLocalBounds(folderIcon);
+            if (plateLocal != null && plateLocal.width() > 0 && plateLocal.height() > 0) {
+                srcW = plateLocal.width();
+                srcH = plateLocal.height();
+                if (originX <= 0f && originY <= 0f) {
+                    originX = plateLocal.left;
+                    originY = plateLocal.top;
+                }
+            } else {
+                srcW = Math.max(1, folderIcon.getWidth());
+                srcH = Math.max(1, folderIcon.getHeight());
+            }
+        }
+        float sx = plateDest.width() / Math.max(1f, srcW);
+        float sy = plateDest.height() / Math.max(1f, srcH);
+
+        // Same transform OEM uses: FolderIcon local → plateDest. Prefer PreviewItemManager.draw.
+        int saveOem = canvas.save();
+        try {
+            canvas.translate(plateDest.left - originX * sx, plateDest.top - originY * sy);
+            canvas.scale(sx, sy);
+            if (invokePreviewManagerDraw(manager, canvas)) return;
+        } finally {
+            canvas.restoreToCount(saveOem);
+        }
+
+        List<?> params = resolvePreviewDrawingParams(manager);
+        if (params == null || params.isEmpty()) return;
         Object intrinsic = invokeNoArgs(manager, "getIntrinsicIconSize");
         float iconSize = intrinsic instanceof Number ? ((Number) intrinsic).floatValue() : 0f;
-        // Preview items are laid out in FolderIcon plate space (bgView size).
-        Rect plateLocal = folderPlateLocalBounds(folderIcon);
-        float srcW = plateLocal != null && plateLocal.width() > 0
-                ? plateLocal.width() : Math.max(1, folderIcon.getWidth());
-        float srcH = plateLocal != null && plateLocal.height() > 0
-                ? plateLocal.height() : Math.max(1, folderIcon.getHeight());
-        float sx = plateDest.width() / srcW;
-        float sy = plateDest.height() / srcH;
         for (int i = params.size() - 1; i >= 0; i--) {
             Object param = params.get(i);
             if (param == null) continue;
@@ -728,8 +1165,9 @@ final class DesktopIconOverlay {
                 bitmap = rasterizeDrawable(drawable, Math.round(size), Math.round(size));
             }
             if (bitmap == null || bitmap.isRecycled()) continue;
-            float left = plateDest.left + transX * sx;
-            float top = plateDest.top + transY * sy;
+            // trans already includes basePreviewOffset — subtract live plate origin only.
+            float left = plateDest.left + (transX - originX) * sx;
+            float top = plateDest.top + (transY - originY) * sy;
             float w = size * scale * sx;
             float h = size * scale * sy;
             BITMAP_PAINT.setAlpha(255);
@@ -1154,8 +1592,16 @@ final class DesktopIconOverlay {
 
             boolean painted = false;
             if (iconSrc != null && isFolderIcon(iconSrc)) {
-                View folder = (sizedSrc != null && isFolderIcon(sizedSrc)) ? sizedSrc : iconSrc;
-                painted = paintFolderIntoSampleAt(folder, dragView, canvas, globalToTarget);
+                // Live LiquidGlass is on DragView content (handleFolderBackground), not the
+                // OEM-stripped FolderIcon plate. Prefer HW-rasterizing that content.
+                View glassHost = dragFolderGlassHost(content, sizedSrc, iconSrc);
+                if (glassHost != null) {
+                    painted = paintDragFolderGlassAt(glassHost, dragView, canvas, globalToTarget);
+                }
+                if (!painted) {
+                    View folder = (sizedSrc != null && isFolderIcon(sizedSrc)) ? sizedSrc : iconSrc;
+                    painted = paintFolderIntoSampleAt(folder, dragView, canvas, globalToTarget);
+                }
             }
             if (!painted && sizedSrc != null && !isFolderIcon(sizedSrc)) {
                 painted = paintAppIconAt(sizedSrc, dragView, canvas, globalToTarget);
@@ -1591,6 +2037,78 @@ final class DesktopIconOverlay {
         return content != null ? content : origin;
     }
 
+    private static View dragFolderGlassHost(View content, View sizedSrc, View iconSrc) {
+        if (content != null && GlassInstaller.get(content) != null) return content;
+        if (sizedSrc != null && GlassInstaller.get(sizedSrc) != null) return sizedSrc;
+        if (iconSrc != null && GlassInstaller.get(iconSrc) != null) return iconSrc;
+        return null;
+    }
+
+    /**
+     * HW-rasterize DragView folder content that carries live LiquidGlass. Software
+     * {@code View.draw} only yields GlassDrawable's soft fallback (looks empty under float).
+     */
+    private static boolean paintDragFolderGlassAt(View glassHost, View dragView, Canvas canvas,
+            Matrix globalToTarget) {
+        if (glassHost == null || dragView == null) return false;
+        int w = glassHost.getWidth() > 0 ? glassHost.getWidth() : dragView.getWidth();
+        int h = glassHost.getHeight() > 0 ? glassHost.getHeight() : dragView.getHeight();
+        if (w <= 0 || h <= 0) return false;
+        try {
+            if (!GlassInstaller.hasBackdropFrame(glassHost)) {
+                GlassInstaller.forceCapture(glassHost);
+            }
+        } catch (Throwable ignored) { }
+        float oldAlpha = glassHost.getAlpha();
+        int oldVis = glassHost.getVisibility();
+        try {
+            if (oldVis != View.VISIBLE) glassHost.setVisibility(View.VISIBLE);
+            if (oldAlpha < 0.99f) glassHost.setAlpha(1f);
+            Bitmap rendered = GlassHwRasterizer.render(w, h, hwCanvas -> {
+                DEPTH.set(DEPTH.get() + 1);
+                try {
+                    glassHost.draw(hwCanvas);
+                } finally {
+                    DEPTH.set(Math.max(0, DEPTH.get() - 1));
+                }
+            });
+            if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+                if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+                // Backdrop may be missing: still blit the GlassDrawable plate alone.
+                GlassDrawable glass = GlassInstaller.get(glassHost);
+                if (glass == null) return false;
+                rendered = GlassHwRasterizer.render(w, h, hwCanvas -> {
+                    Rect old = new Rect(glass.getBounds());
+                    if (old.isEmpty()) glass.setBounds(0, 0, w, h);
+                    try {
+                        glass.draw(hwCanvas);
+                    } finally {
+                        if (old.isEmpty()) glass.setBounds(old);
+                    }
+                });
+            }
+            if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+                if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+                return false;
+            }
+            try {
+                RectF dest = mapDragContentDest(dragView, glassHost,
+                        new Rect(0, 0, w, h), globalToTarget);
+                if (dest == null || dest.width() < 1f || dest.height() < 1f) return false;
+                BITMAP_PAINT.setAlpha(255);
+                canvas.drawBitmap(rendered, null, dest, BITMAP_PAINT);
+                return true;
+            } finally {
+                if (!rendered.isRecycled()) rendered.recycle();
+            }
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            try { glassHost.setAlpha(oldAlpha); } catch (Throwable ignored) { }
+            try { glassHost.setVisibility(oldVis); } catch (Throwable ignored) { }
+        }
+    }
+
     private static boolean paintAppIconAt(View iconSrc, View positionHost, Canvas canvas,
             Matrix globalToTarget) {
         Drawable drawable = iconDrawableOf(iconSrc);
@@ -1653,7 +2171,20 @@ final class DesktopIconOverlay {
         try {
             if (oldVis != View.VISIBLE) drawSrc.setVisibility(View.VISIBLE);
             if (oldAlpha < 0.99f) drawSrc.setAlpha(1f);
-            Bitmap rendered = rasterizeViewSoftware(drawSrc, w, h);
+            Bitmap rendered = null;
+            // LiquidGlass hosts: software draw only yields SoftGlass fallback — prefer HW.
+            if (GlassInstaller.get(drawSrc) != null) {
+                try {
+                    if (!GlassInstaller.hasBackdropFrame(drawSrc)) {
+                        GlassInstaller.forceCapture(drawSrc);
+                    }
+                } catch (Throwable ignored) { }
+                rendered = GlassHwRasterizer.render(w, h, drawSrc::draw);
+            }
+            if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
+                if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+                rendered = rasterizeViewSoftware(drawSrc, w, h);
+            }
             if (rendered == null || rendered.isRecycled() || isMostlyEmpty(rendered)) {
                 if (rendered != null && !rendered.isRecycled()) rendered.recycle();
                 rendered = GlassHwRasterizer.render(w, h, drawSrc::draw);
@@ -1681,10 +2212,15 @@ final class DesktopIconOverlay {
      * @param skipHost when non-null (drag glass), skip the dragged folder itself
      * @param skipIcons DragView origins / create-folder drop-target / open FolderIcon only
      * @param openFolderCover while dragging into an open Folder, skip icons under folder content
+     * @param menuGlass when true, HW-snap apps so onDraw/ViewOverlay 角标 are included;
+     *                  folders use sticky/soft composites (never nested live-plate HW —
+     *                  that corrupts Cos14 folder glass under the menu after mid-release)
+     * @return number of desktop items painted
      */
-    private static void paintDesktopInto(View seed, Canvas canvas, Matrix globalToTarget,
+    private static int paintDesktopInto(View seed, Canvas canvas, Matrix globalToTarget,
             RectF region, View skipHost, java.util.HashSet<View> skipIcons,
-            RectF openFolderCover) {
+            RectF openFolderCover, boolean menuGlass) {
+        int painted = 0;
         List<ViewGroup> containers = iconContainersUnderRegion(seed, region);
         for (ViewGroup icons : containers) {
             for (int i = 0; i < icons.getChildCount(); i++) {
@@ -1711,13 +2247,19 @@ final class DesktopIconOverlay {
                 try {
                     if (isFolderIcon(host) || isFolderIcon(child)) {
                         paintFolderIntoSample(isFolderIcon(host) ? host : child,
-                                canvas, globalToTarget);
+                                canvas, globalToTarget, menuGlass);
+                        painted++;
                     } else if (isWidgetOrCard(host) || isWidgetOrCard(child)) {
                         paintWidget(isWidgetOrCard(host) ? host : child,
                                 canvas, globalToTarget);
+                        painted++;
+                    } else if (menuGlass && paintAppMenuComposite(child, host, canvas,
+                            globalToTarget)) {
+                        painted++;
                     } else {
                         paintAppIcon(host, canvas, globalToTarget);
                         paintAppLabel(host, canvas, globalToTarget);
+                        painted++;
                     }
                 } catch (Throwable ignored) {
                 }
@@ -1733,8 +2275,10 @@ final class DesktopIconOverlay {
                 && intersectsRegion(region, pageIndicator)) {
             try {
                 paintDesktopChrome(pageIndicator, canvas, globalToTarget);
+                painted++;
             } catch (Throwable ignored) { }
         }
+        return painted;
     }
 
     private static boolean isListedDragSource(View host, View child,
@@ -1775,6 +2319,17 @@ final class DesktopIconOverlay {
             }
         }
         WIDGET_SNAPS.clear();
+        clearAppSnaps();
+    }
+
+    /** Drop cached app HW snaps (icon + 角标) so the next menu sample is live. */
+    static void clearAppSnaps() {
+        for (AppSnap snap : APP_SNAPS.values()) {
+            if (snap != null && snap.bitmap != null && !snap.bitmap.isRecycled()) {
+                snap.bitmap.recycle();
+            }
+        }
+        APP_SNAPS.clear();
     }
 
     /** Skip the dragged folder / glass host's own FolderIcon. */
@@ -1852,6 +2407,83 @@ final class DesktopIconOverlay {
         if (bitmap == null || bitmap.isRecycled()) return;
         BITMAP_PAINT.setAlpha(255);
         canvas.drawBitmap(bitmap, null, dest, BITMAP_PAINT);
+    }
+
+    /**
+     * Options-menu sample: rasterize the shortcut host once (cached) so ColorOS 角标
+     * drawn in {@code onDraw} / ViewOverlay appear under menu glass.
+     * Cos16+: {@link GlassHwRasterizer}. Cos14: software {@link #rasterizeViewSoftware}
+     * (HW {@code View.draw} on BubbleTextView/ShortcutContainer causes 花屏).
+     * Falls back to {@link #paintAppIcon}+{@link #paintAppLabel} when raster fails.
+     */
+    private static boolean paintAppMenuComposite(View cellChild, View iconHost,
+            Canvas canvas, Matrix globalToTarget) {
+        // Prefer CellLayout child (ShortcutContainer) so sibling/overlay badges are included.
+        View target = cellChild != null && cellChild.getWidth() > 0 && cellChild.getHeight() > 0
+                ? cellChild : iconHost;
+        if (target == null) return false;
+        if (DEPTH.get() > 0) return false;
+        int w = target.getWidth();
+        int h = target.getHeight();
+        if (w <= 0 || h <= 0) return false;
+
+        boolean cos14Software = ColorOsVersion.detect() == ColorOsVersion.Flavor.LEGACY_13_14;
+        AppSnap cached = APP_SNAPS.get(target);
+        Bitmap rendered = null;
+        if (cached != null && cached.bitmap != null && !cached.bitmap.isRecycled()
+                && cached.width == w && cached.height == h) {
+            rendered = cached.bitmap;
+        } else if (cos14Software) {
+            // Cos14: HW raster of BubbleTextView/ShortcutContainer glitches under menu glass.
+            rendered = rasterizeViewSoftware(target, w, h);
+            if (rendered == null || rendered.isRecycled()) {
+                if (iconHost != null && iconHost != target
+                        && iconHost.getWidth() > 0 && iconHost.getHeight() > 0) {
+                    return paintAppMenuComposite(iconHost, iconHost, canvas, globalToTarget);
+                }
+                return false;
+            }
+            AppSnap snap = new AppSnap();
+            snap.bitmap = rendered;
+            snap.width = w;
+            snap.height = h;
+            AppSnap previous = APP_SNAPS.put(target, snap);
+            if (previous != null && previous.bitmap != null && previous.bitmap != rendered
+                    && !previous.bitmap.isRecycled()) {
+                previous.bitmap.recycle();
+            }
+        } else {
+            rendered = GlassHwRasterizer.render(w, h, hwCanvas -> {
+                DEPTH.set(DEPTH.get() + 1);
+                try {
+                    target.draw(hwCanvas);
+                } finally {
+                    DEPTH.set(Math.max(0, DEPTH.get() - 1));
+                }
+            });
+            if (rendered == null || rendered.isRecycled()) {
+                // Retry on BubbleTextView alone if the wrapper HW snap failed.
+                if (iconHost != null && iconHost != target
+                        && iconHost.getWidth() > 0 && iconHost.getHeight() > 0) {
+                    return paintAppMenuComposite(iconHost, iconHost, canvas, globalToTarget);
+                }
+                return false;
+            }
+            AppSnap snap = new AppSnap();
+            snap.bitmap = rendered;
+            snap.width = w;
+            snap.height = h;
+            AppSnap previous = APP_SNAPS.put(target, snap);
+            if (previous != null && previous.bitmap != null && previous.bitmap != rendered
+                    && !previous.bitmap.isRecycled()) {
+                previous.bitmap.recycle();
+            }
+        }
+        RectF dest = mapItemRectToTarget(target, new Rect(0, 0, w, h), globalToTarget);
+        if (dest == null || dest.width() < 1f || dest.height() < 1f) return false;
+        BITMAP_PAINT.setAlpha(255);
+        canvas.drawBitmap(rendered, null, dest, BITMAP_PAINT);
+        return true;
     }
 
     /**
@@ -2088,6 +2720,11 @@ final class DesktopIconOverlay {
 
     private static void paintFolderIntoSample(View folderIcon, Canvas canvas,
             Matrix globalToTarget) {
+        paintFolderIntoSample(folderIcon, canvas, globalToTarget, false);
+    }
+
+    private static void paintFolderIntoSample(View folderIcon, Canvas canvas,
+            Matrix globalToTarget, boolean popupSample) {
         // Accept/create delegated path: plate + shrunk glyphs are painted by
         // paintOneDelegatedPreview at CellLayout geometry. Skip resting FolderIcon composite
         // (would show full-size / unscaled preview icons).
@@ -2105,7 +2742,7 @@ final class DesktopIconOverlay {
         int w = folderIcon.getWidth();
         int h = folderIcon.getHeight();
         if (w <= 0 || h <= 0) return;
-        Bitmap composite = folderCompositeBitmap(folderIcon, w, h, true);
+        Bitmap composite = folderCompositeBitmap(folderIcon, w, h, true, popupSample);
         if (composite == null || composite.isRecycled()) return;
         RectF dest = mapItemRectToTarget(folderIcon, new Rect(0, 0, w, h), globalToTarget);
         if (dest == null || dest.width() < 1f || dest.height() < 1f) return;
@@ -2147,14 +2784,10 @@ final class DesktopIconOverlay {
 
     /** Plate bounds inside the FolderIcon (excludes the title TextView). */
     private static Rect folderPlateLocalBounds(View folderIcon) {
-        Object background = fieldValue(folderIcon, "mBackground");
-        Object bgViewObj = fieldValue(background, "mBgView");
-        if (bgViewObj instanceof View) {
-            View bg = (View) bgViewObj;
-            if (bg.getWidth() > 0 && bg.getHeight() > 0) {
-                return new Rect(bg.getLeft(), bg.getTop(),
-                        bg.getLeft() + bg.getWidth(), bg.getTop() + bg.getHeight());
-            }
+        View bg = resolveFolderPlateHost(folderIcon);
+        if (bg != null && bg.getWidth() > 0 && bg.getHeight() > 0) {
+            return new Rect(bg.getLeft(), bg.getTop(),
+                    bg.getLeft() + bg.getWidth(), bg.getTop() + bg.getHeight());
         }
         Object preview = fieldValue(folderIcon, "mPreviewFrame");
         if (preview instanceof View) {
@@ -2164,39 +2797,164 @@ final class DesktopIconOverlay {
                         frame.getLeft() + frame.getWidth(), frame.getTop() + frame.getHeight());
             }
         }
+        Object background = fieldValue(folderIcon, "mBackground");
+        Object rectObj = invokeNoArgs(background, "getBackgroundRect");
+        if (rectObj instanceof Rect) {
+            Rect plate = (Rect) rectObj;
+            if (plate.width() > 0 && plate.height() > 0) return new Rect(plate);
+        }
         return null;
     }
 
+    /**
+     * Folder plate glass host.
+     * ColorOS 16: {@code PreviewBackground.mBgView}.
+     * ColorOS 14: synthetic ImageView capture host (no {@code mBgView}).
+     */
+    private static View resolveFolderPlateHost(View folderIcon) {
+        if (folderIcon == null) return null;
+        Object background = fieldValue(folderIcon, "mBackground");
+        Object bgViewObj = fieldValue(background, "mBgView");
+        if (bgViewObj instanceof View) {
+            View bg = (View) bgViewObj;
+            if (bg.getWidth() > 0 && bg.getHeight() > 0) return bg;
+            if (GlassInstaller.get(bg) != null || bg.getBackground() instanceof GlassDrawable) {
+                return bg;
+            }
+        }
+        View capture = findFolderGlassCaptureHost(folderIcon);
+        if (capture != null) return capture;
+        return bgViewObj instanceof View ? (View) bgViewObj : null;
+    }
+
+    /** ColorOS 14: LiquidGlass lives on an invisible ImageView child of FolderIcon. */
+    private static View findFolderGlassCaptureHost(View folderIcon) {
+        if (!(folderIcon instanceof ViewGroup)) return null;
+        ViewGroup group = (ViewGroup) folderIcon;
+        View fallback = null;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child == null) continue;
+            boolean hasGlass = GlassInstaller.get(child) != null
+                    || child.getBackground() instanceof GlassDrawable;
+            if (!hasGlass) continue;
+            if (child instanceof android.widget.ImageView) return child;
+            if (fallback == null) fallback = child;
+        }
+        return fallback;
+    }
+
     private static Bitmap folderCompositeBitmap(View folderIcon, int width, int height) {
-        return folderCompositeBitmap(folderIcon, width, height, true);
+        return folderCompositeBitmap(folderIcon, width, height, true, false);
     }
 
     private static Bitmap folderCompositeBitmap(View folderIcon, int width, int height,
             boolean includeName) {
-        Object background = fieldValue(folderIcon, "mBackground");
-        Object bgViewObj = fieldValue(background, "mBgView");
-        View bgView = bgViewObj instanceof View ? (View) bgViewObj : null;
+        return folderCompositeBitmap(folderIcon, width, height, includeName, false);
+    }
+
+    /**
+     * @param popupSample when true (options-menu glass), sticky cache — avoid continuous
+     *                    live-plate HW (Cos14 mid-release 花屏). Cos14 warms the invisible
+     *                    plate backdrop once then one-shot HW so AGSL glass is visible.
+     */
+    private static Bitmap folderCompositeBitmap(View folderIcon, int width, int height,
+            boolean includeName, boolean popupSample) {
+        View bgView = resolveFolderPlateHost(folderIcon);
+        boolean liveGlass = bgView != null && (GlassInstaller.get(bgView) != null
+                || bgView.getBackground() instanceof GlassDrawable);
+        boolean cos14 = ColorOsVersion.detect() == ColorOsVersion.Flavor.LEGACY_13_14;
+        // Use the already-warmed plate frame only. Never forceCapture on Cos16 menu path —
+        // nested capture while sampling options-menu glass corrupts the folder plate (花屏).
         Bitmap plateSource = bgView == null ? null : BackdropCapture.snapshotOf(bgView);
         FolderSnap cached = FOLDER_SNAPS.get(folderIcon);
         if (cached != null && cached.bitmap != null && !cached.bitmap.isRecycled()
                 && cached.width == width && cached.height == height
-                && cached.includeName == includeName
-                && cached.plateSource == plateSource) {
-            return cached.bitmap;
+                && cached.includeName == includeName) {
+            if (popupSample) {
+                // Cos14 SoftGlass (no backdrop) must not stick — frame looks missing under menu.
+                if (!cos14 || cached.popupGlassReady) {
+                    return cached.bitmap;
+                }
+            } else if (cached.plateSource == plateSource) {
+                return cached.bitmap;
+            } else if (plateSource == null && cached.plateSource != null && !liveGlass) {
+                // Folder options-menu OEM-only strips plate glass (plateSource→null). Keep the
+                // last LiquidGlass composite so float-menu ashmem still shows glass under the menu.
+                return cached.bitmap;
+            }
+        }
+        // After OEM-only: do not rebuild/overwrite with an empty OEM plate.
+        // ColorOS 14 has no mBgView snapshot — allow rebuild from the live glass host.
+        if (plateSource == null && !liveGlass) {
+            FolderSnap glassSnap = findRetainedGlassSnap(folderIcon, width, height, includeName);
+            if (glassSnap != null) return glassSnap.bitmap;
+            return null;
         }
 
         final int drawW = width;
         final int drawH = height;
         final boolean drawName = includeName;
-        Bitmap rendered = GlassHwRasterizer.render(drawW, drawH, hwCanvas -> {
+        final View plateHost = bgView;
+        Bitmap rendered;
+        boolean glassReady = false;
+        if (popupSample && cos14 && liveGlass && plateHost != null) {
+            // Cos14 plate ImageView is INVISIBLE — PreDraw never warms it. Warm backdrop once
+            // (safe; does not HW-rasterize GlassDrawable), then one-shot AGSL into sticky snap.
+            if (!GlassInstaller.hasBackdropFrame(plateHost)) {
+                try {
+                    GlassInstaller.forceCapturePreviewPlate(plateHost);
+                } catch (Throwable ignored) { }
+            }
+            plateSource = BackdropCapture.snapshotOf(plateHost);
+            if (GlassInstaller.hasBackdropFrame(plateHost)) {
+                rendered = hwFolderComposite(folderIcon, plateHost, drawW, drawH, drawName);
+                glassReady = rendered != null && !rendered.isRecycled();
+            } else {
+                // No backdrop yet — glyphs-only soft; leave glassReady false to retry next pump.
+                rendered = softFolderComposite(folderIcon, plateHost, null, drawW, drawH,
+                        drawName);
+            }
+        } else if (popupSample && plateSource != null) {
+            // Cos16 / already-warmed plate: software blit of captured backdrop + glyphs.
+            rendered = softFolderComposite(folderIcon, plateHost, plateSource, drawW, drawH,
+                    drawName);
+            glassReady = true;
+        } else if (popupSample) {
+            rendered = softFolderComposite(folderIcon, plateHost, plateSource, drawW, drawH,
+                    drawName);
+            glassReady = plateSource != null;
+        } else {
+            rendered = hwFolderComposite(folderIcon, plateHost, drawW, drawH, drawName);
+            glassReady = true;
+        }
+        if (rendered == null || rendered.isRecycled()) return null;
+
+        FolderSnap snap = new FolderSnap();
+        snap.bitmap = rendered;
+        snap.plateSource = plateSource;
+        snap.width = width;
+        snap.height = height;
+        snap.includeName = includeName;
+        snap.popupGlassReady = glassReady;
+        FolderSnap previous = FOLDER_SNAPS.put(folderIcon, snap);
+        if (previous != null && previous.bitmap != null && previous.bitmap != rendered
+                && !previous.bitmap.isRecycled()) {
+            previous.bitmap.recycle();
+        }
+        return rendered;
+    }
+
+    private static Bitmap hwFolderComposite(View folderIcon, View plateHost, int drawW, int drawH,
+            boolean drawName) {
+        return GlassHwRasterizer.render(drawW, drawH, hwCanvas -> {
             DEPTH.set(DEPTH.get() + 1);
             try {
-                // When compositing plate-only, shift so bgView top-left maps to (0,0).
                 int dx = 0;
                 int dy = 0;
-                if (!drawName && bgView != null) {
-                    dx = -bgView.getLeft();
-                    dy = -bgView.getTop();
+                if (!drawName && plateHost != null) {
+                    dx = -plateHost.getLeft();
+                    dy = -plateHost.getTop();
                 }
                 int save = hwCanvas.save();
                 hwCanvas.translate(dx, dy);
@@ -2213,49 +2971,118 @@ final class DesktopIconOverlay {
                 DEPTH.set(Math.max(0, DEPTH.get() - 1));
             }
         });
-        if (rendered == null || rendered.isRecycled()) return null;
+    }
 
-        FolderSnap snap = new FolderSnap();
-        snap.bitmap = rendered;
-        snap.plateSource = plateSource;
-        snap.width = width;
-        snap.height = height;
-        snap.includeName = includeName;
-        FolderSnap previous = FOLDER_SNAPS.put(folderIcon, snap);
-        if (previous != null && previous.bitmap != null && previous.bitmap != rendered
-                && !previous.bitmap.isRecycled()) {
-            previous.bitmap.recycle();
+    /**
+     * Software folder plate for options-menu sampling (no {@link GlassHwRasterizer}).
+     * Prefer an already-captured plate bitmap when present so AGSL glass stays in the sample
+     * without re-entering the live plate's HW pipeline.
+     */
+    private static Bitmap softFolderComposite(View folderIcon, View bgView, Bitmap plateSource,
+            int width, int height, boolean includeName) {
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        int dx = 0;
+        int dy = 0;
+        if (!includeName && bgView != null) {
+            dx = -bgView.getLeft();
+            dy = -bgView.getTop();
         }
-        return rendered;
+        int save = canvas.save();
+        canvas.translate(dx, dy);
+        try {
+            if (plateSource != null && !plateSource.isRecycled() && bgView != null) {
+                int left = bgView.getLeft();
+                int top = bgView.getTop();
+                int plateW = bgView.getWidth();
+                int plateH = bgView.getHeight();
+                if (plateW > 0 && plateH > 0) {
+                    BITMAP_PAINT.setAlpha(255);
+                    canvas.drawBitmap(plateSource, null,
+                            new RectF(left, top, left + plateW, top + plateH), BITMAP_PAINT);
+                } else {
+                    drawFolderPlate(folderIcon, canvas);
+                }
+            } else {
+                drawFolderPlate(folderIcon, canvas);
+            }
+            paintFolderPreviewBitmaps(folderIcon, canvas);
+            if (includeName) {
+                paintFolderName(folderIcon, canvas);
+            }
+        } catch (Throwable ignored) {
+            canvas.restoreToCount(save);
+            bitmap.recycle();
+            return null;
+        }
+        canvas.restoreToCount(save);
+        return bitmap;
+    }
+
+    /** Any retained LiquidGlass folder snap (prefer exact size, else any plateSource!=null). */
+    private static FolderSnap findRetainedGlassSnap(View folderIcon, int width, int height,
+            boolean includeName) {
+        FolderSnap exact = FOLDER_SNAPS.get(folderIcon);
+        if (exact != null && exact.bitmap != null && !exact.bitmap.isRecycled()
+                && exact.plateSource != null
+                && exact.width == width && exact.height == height
+                && exact.includeName == includeName) {
+            return exact;
+        }
+        if (exact != null && exact.bitmap != null && !exact.bitmap.isRecycled()
+                && exact.plateSource != null) {
+            return exact;
+        }
+        return null;
     }
 
     private static void drawFolderPlate(View folderIcon, Canvas canvas) {
         Object background = fieldValue(folderIcon, "mBackground");
         // Accept/create path: plate is painted by paintDelegatedFolderPreviews at CellLayout
-        // geometry (scaled). Skip the resting mBgView plate to avoid a stale double draw.
+        // geometry (scaled). Skip the resting plate host to avoid a stale double draw.
         if (isPreviewDrawingDelegated(background)) return;
-        Object bgViewObj = fieldValue(background, "mBgView");
-        if (!(bgViewObj instanceof View)) return;
-        View bgView = (View) bgViewObj;
-        if (bgView.getWidth() <= 0 || bgView.getHeight() <= 0) return;
+        View bgView = resolveFolderPlateHost(folderIcon);
+        if (bgView == null) return;
+        int left = bgView.getLeft();
+        int top = bgView.getTop();
+        int plateW = bgView.getWidth();
+        int plateH = bgView.getHeight();
+        if (plateW <= 0 || plateH <= 0) {
+            Object rectObj = invokeNoArgs(background, "getBackgroundRect");
+            if (rectObj instanceof Rect) {
+                Rect plate = (Rect) rectObj;
+                if (plate.width() > 0 && plate.height() > 0) {
+                    left = plate.left;
+                    top = plate.top;
+                    plateW = plate.width();
+                    plateH = plate.height();
+                }
+            }
+        }
+        if (plateW <= 0 || plateH <= 0) return;
         int save = canvas.save();
-        canvas.translate(bgView.getLeft(), bgView.getTop());
+        canvas.translate(left, top);
         try {
             GlassDrawable glass = GlassInstaller.get(bgView);
+            if (glass == null && bgView.getBackground() instanceof GlassDrawable) {
+                glass = (GlassDrawable) bgView.getBackground();
+            }
             if (glass != null) {
                 Rect old = new Rect(glass.getBounds());
-                if (old.isEmpty()) {
-                    glass.setBounds(0, 0, bgView.getWidth(), bgView.getHeight());
+                if (old.isEmpty() || old.width() != plateW || old.height() != plateH) {
+                    glass.setBounds(0, 0, plateW, plateH);
                 }
                 glass.draw(canvas);
-                if (old.isEmpty()) glass.setBounds(old);
+                if (old.isEmpty() || old.width() != plateW || old.height() != plateH) {
+                    glass.setBounds(old);
+                }
                 return;
             }
             Drawable drawable = bgView.getBackground();
             if (drawable != null) {
                 Rect old = new Rect(drawable.getBounds());
                 if (old.isEmpty()) {
-                    drawable.setBounds(0, 0, bgView.getWidth(), bgView.getHeight());
+                    drawable.setBounds(0, 0, plateW, plateH);
                 }
                 drawable.draw(canvas);
                 if (old.isEmpty()) drawable.setBounds(old);
@@ -2268,40 +3095,100 @@ final class DesktopIconOverlay {
     private static void paintFolderPreviewBitmaps(View folderIcon, Canvas canvas) {
         Object manager = fieldValue(folderIcon, "mPreviewItemManager");
         if (manager == null) return;
-        Object paramsObj = invokeNoArgs(manager, "getCurrentPageParams");
-        if (!(paramsObj instanceof List)) return;
-        List<?> params = (List<?>) paramsObj;
+        boolean cos14 = ColorOsVersion.detect() == ColorOsVersion.Flavor.LEGACY_13_14;
+        // Prefer OEM PreviewItemManager.draw on HW — ColorOS 14 applies basePreviewOffset /
+        // previewStyleBoundOffset there. Cos14 soft canvas: OEM draw often no-ops or misplaces
+        // glyphs (top-left); use params + basePreviewOffset instead. Cos16 keeps OEM draw.
+        if (!cos14 || canvas.isHardwareAccelerated()) {
+            int saveOem = canvas.save();
+            try {
+                if (invokePreviewManagerDraw(manager, canvas)) return;
+            } finally {
+                canvas.restoreToCount(saveOem);
+            }
+        }
+
+        List<?> params = resolvePreviewDrawingParams(manager);
+        if (params == null || params.isEmpty()) return;
         Object intrinsic = invokeNoArgs(manager, "getIntrinsicIconSize");
         float iconSize = intrinsic instanceof Number
                 ? ((Number) intrinsic).floatValue()
                 : 0f;
-        for (int i = params.size() - 1; i >= 0; i--) {
-            Object param = params.get(i);
-            if (param == null) continue;
-            Object hidden = fieldValue(param, "hidden");
-            if (hidden instanceof Boolean && (Boolean) hidden) continue;
-            Object d = fieldValue(param, "drawable");
-            if (!(d instanceof Drawable)) continue;
-            Drawable drawable = (Drawable) d;
-            float transX = floatField(param, "transX");
-            float transY = floatField(param, "transY");
-            float scale = floatField(param, "scale");
-            if (scale <= 0f) scale = 1f;
-            Rect bounds = drawable.getBounds();
-            float size = iconSize > 0f ? iconSize
-                    : Math.max(1, bounds.isEmpty() ? 48 : bounds.width());
-            Bitmap bitmap = softwareBitmap(fastBitmapOf(drawable));
-            if (bitmap == null) {
-                bitmap = rasterizeDrawable(drawable, Math.round(size), Math.round(size));
+        Object background = fieldValue(folderIcon, "mBackground");
+        // Cos16 Oplus layout already folds basePreviewOffset into transX/Y.
+        // Cos14 mFirstPageParams trans is plate-local — must add basePreviewOffset or
+        // glyphs sit in the FolderIcon top-left under menu glass.
+        float ox = cos14 ? floatField(background, "basePreviewOffsetX") : 0f;
+        float oy = cos14 ? floatField(background, "basePreviewOffsetY") : 0f;
+        int saveAll = canvas.save();
+        try {
+            if (ox != 0f || oy != 0f) canvas.translate(ox, oy);
+            for (int i = params.size() - 1; i >= 0; i--) {
+                Object param = params.get(i);
+                if (param == null) continue;
+                Object hidden = fieldValue(param, "hidden");
+                if (hidden instanceof Boolean && (Boolean) hidden) continue;
+                Object d = fieldValue(param, "drawable");
+                if (!(d instanceof Drawable)) continue;
+                Drawable drawable = (Drawable) d;
+                float transX = floatField(param, "transX");
+                float transY = floatField(param, "transY");
+                float scale = floatField(param, "scale");
+                if (scale <= 0f) scale = 1f;
+                Rect bounds = drawable.getBounds();
+                float size = iconSize > 0f ? iconSize
+                        : Math.max(1, bounds.isEmpty() ? 48 : bounds.width());
+                Bitmap bitmap = softwareBitmap(fastBitmapOf(drawable));
+                if (bitmap == null) {
+                    bitmap = rasterizeDrawable(drawable, Math.round(size), Math.round(size));
+                }
+                if (bitmap == null || bitmap.isRecycled()) continue;
+                int save = canvas.save();
+                canvas.translate(transX, transY);
+                canvas.scale(scale, scale);
+                BITMAP_PAINT.setAlpha(255);
+                canvas.drawBitmap(bitmap, null, new RectF(0f, 0f, size, size), BITMAP_PAINT);
+                canvas.restoreToCount(save);
             }
-            if (bitmap == null || bitmap.isRecycled()) continue;
-            int save = canvas.save();
-            canvas.translate(transX, transY);
-            canvas.scale(scale, scale);
-            BITMAP_PAINT.setAlpha(255);
-            canvas.drawBitmap(bitmap, null, new RectF(0f, 0f, size, size), BITMAP_PAINT);
-            canvas.restoreToCount(save);
+        } finally {
+            canvas.restoreToCount(saveAll);
         }
+    }
+
+    /** ColorOS 14: public fields {@code mFirstPageParams}/{@code mCurrentPageParams}. */
+    private static List<?> resolvePreviewDrawingParams(Object manager) {
+        if (manager == null) return null;
+        Object paramsObj = invokeNoArgs(manager, "getCurrentPageParams");
+        if (paramsObj instanceof List && !((List<?>) paramsObj).isEmpty()) {
+            return (List<?>) paramsObj;
+        }
+        paramsObj = invokeNoArgs(manager, "getFirstPageDrawingParams");
+        if (paramsObj instanceof List && !((List<?>) paramsObj).isEmpty()) {
+            return (List<?>) paramsObj;
+        }
+        paramsObj = fieldValue(manager, "mFirstPageParams");
+        if (paramsObj instanceof List && !((List<?>) paramsObj).isEmpty()) {
+            return (List<?>) paramsObj;
+        }
+        paramsObj = fieldValue(manager, "mCurrentPageParams");
+        if (paramsObj instanceof List) return (List<?>) paramsObj;
+        return null;
+    }
+
+    private static boolean invokePreviewManagerDraw(Object manager, Canvas canvas) {
+        if (manager == null || canvas == null) return false;
+        Class<?> c = manager.getClass();
+        while (c != null) {
+            try {
+                java.lang.reflect.Method m = c.getDeclaredMethod("draw", Canvas.class);
+                m.setAccessible(true);
+                m.invoke(manager, canvas);
+                return true;
+            } catch (Throwable ignored) {
+                c = c.getSuperclass();
+            }
+        }
+        return false;
     }
 
     private static void paintFolderName(View folderIcon, Canvas canvas) {

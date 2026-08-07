@@ -83,6 +83,7 @@ object RootController {
     private fun matches(preferences: android.content.SharedPreferences, config: GlassConfig): Boolean =
         preferences.getBoolean("enabled", !config.enabled) == config.enabled &&
             preferences.getBoolean("hide_desktop_icons", !config.hideDesktopIcons) == config.hideDesktopIcons &&
+            preferences.getBoolean("modify_menu_style", !config.modifyMenuStyle) == config.modifyMenuStyle &&
             preferences.getFloat("glass_intensity", Float.NaN) == config.glassIntensity &&
             preferences.getFloat("blur_radius", Float.NaN) == config.blurRadius &&
             preferences.getFloat("refraction_height", Float.NaN) == config.refractionHeight &&

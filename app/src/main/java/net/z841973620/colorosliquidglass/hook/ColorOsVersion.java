@@ -51,11 +51,21 @@ public final class ColorOsVersion {
     }
 
     /**
-     * Refine detection with the target package ClassLoader when system properties are missing.
-     * A conclusive property-based major version is never overridden.
+     * Refine detection with the target package ClassLoader when system properties are missing
+     * or contradict modern SystemUI surfaces (FlexibleMenuManager).
      */
     public static Flavor detect(ClassLoader cl) {
         Flavor fromProps = detect();
+        if (cl != null && classExists(cl, "com.oplus.flexibletask.menu.FlexibleMenuManager")) {
+            // Property major can mis-report 14 on ColorOS 16 builds; float menu is authoritative.
+            if (fromProps != Flavor.MODERN) {
+                synchronized (ColorOsVersion.class) {
+                    cached = Flavor.MODERN;
+                    Log.i(TAG, "ColorOS API probe → MODERN (FlexibleMenuManager overrides props)");
+                }
+            }
+            return Flavor.MODERN;
+        }
         if (cachedMajor > 0) return fromProps;
         if (cl == null) return fromProps;
         synchronized (ColorOsVersion.class) {
@@ -75,12 +85,6 @@ public final class ColorOsVersion {
                     Log.i(TAG, "ColorOS API probe → LEGACY_13_14 (no LayerBlur/mBgView)");
                     return cached;
                 }
-                // SystemUI ClassLoader: FlexibleMenuManager is ColorOS 15+/16 float-menu surface.
-                if (classExists(cl, "com.oplus.flexibletask.menu.FlexibleMenuManager")) {
-                    cached = Flavor.MODERN;
-                    Log.i(TAG, "ColorOS API probe → MODERN (FlexibleMenuManager present)");
-                    return cached;
-                }
             } catch (Throwable t) {
                 Log.w(TAG, "ColorOS API probe failed", t);
             }
@@ -88,16 +92,19 @@ public final class ColorOsVersion {
         }
     }
 
-    /** True when ColorOS 13/14 Hook backend should be used. */
+    /** True when ColorOS 13/14 Hook backend should be used for Launcher APIs. */
     public static boolean usesLegacyLauncherApis(ClassLoader cl) {
+        // FlexibleMenuManager is the ColorOS 15+/16 float-menu surface — never treat as legacy.
+        if (cl != null && classExists(cl, "com.oplus.flexibletask.menu.FlexibleMenuManager")) {
+            return false;
+        }
         Flavor flavor = detect(cl);
         if (flavor == Flavor.LEGACY_13_14) return true;
         if (flavor == Flavor.MODERN) return false;
         if (cl == null) return false;
         // UNKNOWN: decide from API markers visible in this ClassLoader.
         if (classExists(cl, "com.android.launcher3.uioverrides.states.blurdrawable.LayerBlurDrawable")
-                || hasField(cl, "com.android.launcher3.folder.OplusPreviewBackground", "mBgView")
-                || classExists(cl, "com.oplus.flexibletask.menu.FlexibleMenuManager")) {
+                || hasField(cl, "com.android.launcher3.folder.OplusPreviewBackground", "mBgView")) {
             return false;
         }
         if (classExists(cl, "com.android.launcher3.folder.OplusPreviewBackground")) {

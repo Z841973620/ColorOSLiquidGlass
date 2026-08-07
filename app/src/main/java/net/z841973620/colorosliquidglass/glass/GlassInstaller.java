@@ -125,6 +125,35 @@ public final class GlassInstaller {
     }
 
     /**
+     * Keep options-menu backdrop sampling alive for the whole open animation (needed after
+     * mid-release when DragView stops invalidating the tree).
+     */
+    public static void setDesktopPopupOpenAnimating(View view, boolean animating) {
+        BackdropCapture.setDesktopPopupOpenAnimating(view, animating);
+    }
+
+    /**
+     * More-functions submenu open/close: primary plate is intentionally scaled to ~0.9 /
+     * dimmed to ~0.6. Capture must not treat that as options-menu open-anim (which would
+     * PopupScaleSnapshot-normalize scale back to 1 and kill the shrink).
+     */
+    public static void setMoreFunctionsSubMenuActive(boolean active) {
+        BackdropCapture.setMoreFunctionsSubMenuActive(active);
+    }
+
+    public static boolean isMoreFunctionsSubMenuActive() {
+        return BackdropCapture.isMoreFunctionsSubMenuActive();
+    }
+
+    /**
+     * Mid-release / drag teardown: raise options-menu open sampling above the freeze that
+     * follows DragView invalidate loss.
+     */
+    public static void prioritizeDesktopPopupOpenSampling() {
+        BackdropCapture.prioritizeDesktopPopupOpenSampling();
+    }
+
+    /**
      * Force-capture a folder preview plate without baking glass / AGSL-fallback into the
      * sample (see {@link #beginPreviewBackdropCapture}).
      */

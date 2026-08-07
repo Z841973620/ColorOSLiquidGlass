@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.view.Choreographer;
 import android.view.View;
 import android.view.ViewParent;
 import android.view.ViewTreeObserver;
@@ -70,7 +71,9 @@ import java.util.WeakHashMap;
             }
         }
         if (previous != overlay) {
-            DesktopIconOverlay.clearFolderSnaps();
+            // Never clearFolderSnaps here. Menu install calls setOverlaySource(null) on nested
+            // hosts and would wipe LiquidGlass folder composites needed by float ashmem.
+            // Snaps are cleared in clearAllOverlaySources() on drag end.
             if (previous != null) TaskContentOverlay.clearProtectCache(previous);
             if (overlay == null && previous != null) {
                 // Menu torn down — drop locked protect bake for the prior task.
@@ -81,12 +84,88 @@ import java.util.WeakHashMap;
         if (target != null) target.invalidate();
     }
 
-    /** Drop every drag-glass overlay seed (finger-up must not leave seeds on FolderIcons). */
+    /**
+     * Drop drag-glass overlay seeds on finger-up. Preserve {@code colg_desktop_popup} workspace
+     * bindings — mid-release must not strip menu sampling and freeze the open-anim backdrop.
+     */
     static void clearAllOverlaySources() {
+        ArrayList<View> popupHosts = new ArrayList<>();
+        ArrayList<View> popupSeeds = new ArrayList<>();
         synchronized (CAPTURES) {
+            for (Map.Entry<View, WeakReference<View>> entry : OVERLAY_SOURCES.entrySet()) {
+                View host = entry.getKey();
+                if (!isDesktopPopupGlass(host)) continue;
+                WeakReference<View> ref = entry.getValue();
+                View seed = ref == null ? null : ref.get();
+                if (seed == null) continue;
+                popupHosts.add(host);
+                popupSeeds.add(seed);
+            }
             OVERLAY_SOURCES.clear();
+            for (int i = 0; i < popupHosts.size(); i++) {
+                OVERLAY_SOURCES.put(popupHosts.get(i), new WeakReference<>(popupSeeds.get(i)));
+            }
         }
-        DesktopIconOverlay.clearFolderSnaps();
+        // Open-anim menu still needs folder/app snaps; wiping them here lets mid-release
+        // refuse to publish and freeze the half-open frame over continuous open sampling.
+        if (!hasLiveDesktopPopupOpening()) {
+            DesktopIconOverlay.clearFolderSnaps();
+        }
+        prioritizeDesktopPopupOpenSampling();
+    }
+
+    /** True when an options-menu glass is still in open scale/alpha motion. */
+    private static boolean hasLiveDesktopPopupOpening() {
+        ArrayList<View> hosts = new ArrayList<>();
+        ArrayList<BackdropCapture> captures = new ArrayList<>();
+        synchronized (CAPTURES) {
+            for (Map.Entry<View, BackdropCapture> entry : CAPTURES.entrySet()) {
+                View host = entry.getKey();
+                if (!isDesktopPopupGlass(host)) continue;
+                BackdropCapture capture = entry.getValue();
+                if (capture == null) continue;
+                hosts.add(host);
+                captures.add(capture);
+            }
+        }
+        for (int i = 0; i < hosts.size(); i++) {
+            if (captures.get(i).isDesktopPopupOpening(hosts.get(i))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Mid-release stops DragView invalidates; raise open-anim menu sampling above that freeze.
+     * Safe no-op when no {@code colg_desktop_popup} is attached.
+     */
+    static void prioritizeDesktopPopupOpenSampling() {
+        ArrayList<View> hosts = new ArrayList<>();
+        synchronized (CAPTURES) {
+            for (Map.Entry<View, BackdropCapture> entry : CAPTURES.entrySet()) {
+                View host = entry.getKey();
+                if (!isDesktopPopupGlass(host)) continue;
+                BackdropCapture capture = entry.getValue();
+                if (capture == null) continue;
+                capture.desktopPopupOpenAnimActive = true;
+                capture.dirty = true;
+                capture.desktopPopupSettling = true;
+                capture.skipCaptureFromSelfInvalidate = false;
+                hosts.add(host);
+            }
+        }
+        for (View host : hosts) {
+            try {
+                forceCapture(host);
+            } catch (Throwable ignored) { }
+            try {
+                host.invalidate();
+            } catch (Throwable ignored) { }
+            BackdropCapture capture;
+            synchronized (CAPTURES) {
+                capture = CAPTURES.get(host);
+            }
+            if (capture != null) capture.scheduleDesktopPopupPump();
+        }
     }
 
     /** Desktop CellLayout (or page) bound for {@link DesktopIconOverlay}. */
@@ -185,9 +264,117 @@ import java.util.WeakHashMap;
     private int publishedDragSeedGeneration = -1;
     /** Task-menu open anim scales 0.9→1; track settle so we never freeze a sub-1 frame. */
     private boolean taskMenuScaleSettling;
+    /** Desktop options-menu: resample while open anim runs; freeze once settled with icons. */
+    private boolean desktopPopupSettling;
+    /** Desktop options-menu has published a frame that includes desktop icons. */
+    private boolean desktopPopupHasIcons;
+    /**
+     * True from options-menu open-animator attach until onAnimationEnd.
+     * Mid-release stops DragView invalidates; a Choreographer callback must keep sampling
+     * because onPreDraw often early-returns (low alpha / skipCapture) without re-arming.
+     */
+    private boolean desktopPopupOpenAnimActive;
+    private boolean desktopPopupPumpPosted;
+    private final Choreographer.FrameCallback desktopPopupPump;
+
+    /** More-functions submenu open: primary plate held at ~0.9 scale / ~0.6 alpha. */
+    private static volatile boolean moreFunctionsSubMenuActive;
+
+    static void setMoreFunctionsSubMenuActive(boolean active) {
+        moreFunctionsSubMenuActive = active;
+    }
+
+    static boolean isMoreFunctionsSubMenuActive() {
+        return moreFunctionsSubMenuActive;
+    }
+
+    /**
+     * Kick options-menu live sampling. While {@code colg_desktop_popup} stays tagged and
+     * attached, Choreographer keeps resampling through open → fully open → close
+     * (needed for badge updates under the glass).
+     */
+    static void setDesktopPopupOpenAnimating(View target, boolean animating) {
+        if (target == null) return;
+        BackdropCapture capture;
+        synchronized (CAPTURES) {
+            capture = CAPTURES.get(target);
+            if (capture == null) {
+                capture = new BackdropCapture(target);
+                CAPTURES.put(target, capture);
+            }
+            capture.desktopPopupOpenAnimActive = animating;
+            capture.dirty = true;
+            capture.desktopPopupSettling = true;
+            capture.skipCaptureFromSelfInvalidate = false;
+        }
+        if (animating) {
+            // Open-anim priority: capture immediately so mid-release cannot freeze first.
+            try {
+                forceCapture(target);
+            } catch (Throwable ignored) { }
+        }
+        capture.scheduleDesktopPopupPump();
+    }
+
+    /** Pump while {@code colg_desktop_popup} is attached — full menu lifetime. */
+    private void scheduleDesktopPopupPump() {
+        if (desktopPopupPumpPosted) return;
+        View target = targetRef.get();
+        if (target == null || !target.isAttachedToWindow()) return;
+        if (!isDesktopPopupGlass(target)) return;
+        desktopPopupPumpPosted = true;
+        try {
+            Choreographer.getInstance().postFrameCallback(desktopPopupPump);
+        } catch (Throwable ignored) {
+            desktopPopupPumpPosted = false;
+        }
+    }
+
+    /** True while open scale/alpha is still in flight (or open-anim flag still set). */
+    private boolean isDesktopPopupOpening(View host) {
+        if (host == null) return false;
+        // More-functions keeps the primary options plate at ~0.9 / ~0.6 while the submenu
+        // opens. That is NOT an open-anim — treating it as one forceCapture+normalize-scale
+        // fights the OEM spring and kills the shrink.
+        if (moreFunctionsSubMenuActive) {
+            return false;
+        }
+        if (desktopPopupOpenAnimActive) {
+            View owner = captureOwner(host);
+            // Cancel can leave the flag set after OEM jumps to identity — treat settled
+            // geometry as fully open so badge clearAppSnaps can run.
+            if (owner != null && cumulativeScale(owner) >= 0.995f
+                    && cumulativeAlpha(owner) >= 0.99f) {
+                return false;
+            }
+            return true;
+        }
+        View owner = captureOwner(host);
+        if (owner == null) owner = host;
+        return cumulativeScale(owner) < 0.995f || cumulativeAlpha(owner) < 0.99f;
+    }
 
     private BackdropCapture(View target) {
         targetRef = new WeakReference<>(target);
+        desktopPopupPump = frameTimeNanos -> {
+            desktopPopupPumpPosted = false;
+            View host = targetRef.get();
+            if (host == null || !host.isAttachedToWindow()) return;
+            if (!isDesktopPopupGlass(host)) return;
+            dirty = true;
+            desktopPopupSettling = true;
+            skipCaptureFromSelfInvalidate = false;
+            // Open period: forceCapture beats mid-release PreDraw early-returns / freeze.
+            if (isDesktopPopupOpening(host)) {
+                try {
+                    forceCapture(host);
+                } catch (Throwable ignored) { }
+            }
+            try {
+                host.invalidate();
+            } catch (Throwable ignored) { }
+            scheduleDesktopPopupPump();
+        };
         View root = rootOf(target);
         rootRef = new WeakReference<>(root);
         root.addOnAttachStateChangeListener(this);
@@ -225,6 +412,7 @@ import java.util.WeakHashMap;
         View owner = captureOwner(target);
         if (recording || owner == null || !owner.isShown()
                 || target.getWidth() <= 0 || target.getHeight() <= 0) {
+            if (isDesktopPopupGlass(target)) scheduleDesktopPopupPump();
             return true;
         }
 
@@ -235,6 +423,7 @@ import java.util.WeakHashMap;
         if (geometryChanged) dirty = true;
 
         boolean taskGlass = TaskContentOverlay.isTaskView(overlaySourceOf(target));
+        boolean desktopPopupGlass = isDesktopPopupGlass(target);
         if (taskGlass) {
             float scale = cumulativeScale(owner);
             boolean settled = scale >= 0.995f;
@@ -244,6 +433,12 @@ import java.util.WeakHashMap;
                 dirty = true;
                 skipCaptureFromSelfInvalidate = false;
             }
+        }
+        if (desktopPopupGlass) {
+            // Full menu lifetime: keep resampling so badge changes stay visible.
+            desktopPopupSettling = true;
+            dirty = true;
+            skipCaptureFromSelfInvalidate = false;
         }
 
         // SystemUI float menus: live while open. Keep a Choreographer pump via
@@ -271,6 +466,7 @@ import java.util.WeakHashMap;
         // good snapshot with an empty frame; stay dirty until the hierarchy is visible again.
         if (cumulativeAlpha(owner) < 0.08f || root.getAlpha() < 0.08f) {
             dirty = true;
+            if (desktopPopupGlass) scheduleDesktopPopupPump();
             return true;
         }
 
@@ -278,7 +474,10 @@ import java.util.WeakHashMap;
         // background-scale change (Recents wallpaper zoom keeps folder layout coords fixed).
         if (skipCaptureFromSelfInvalidate) {
             skipCaptureFromSelfInvalidate = false;
-            if (!geometryChanged && !dirty) return true;
+            if (!geometryChanged && !dirty) {
+                if (desktopPopupGlass) scheduleDesktopPopupPump();
+                return true;
+            }
         }
 
         boolean wallpaperAnimating = WallpaperScaleTracker.isAnimating();
@@ -289,17 +488,30 @@ import java.util.WeakHashMap;
         if (taskGlass) {
             wallpaperAnimating = false;
         }
-        boolean moving = geometryChanged || underDrag || wallpaperAnimating || taskMenuScaleSettling;
+        boolean moving = geometryChanged || underDrag || wallpaperAnimating
+                || taskMenuScaleSettling || desktopPopupSettling;
 
         // Stationary: keep the last good frame (no idle re-sample). Still allow a one-shot
         // when there is no frame yet, or dirty was set by unlock / install / forceCapture.
+        // Desktop popup without icons must keep retrying until an icon frame lands.
         if (!moving) {
-            if (validFrame && !dirty) return true;
+            if (desktopPopupGlass && !desktopPopupHasIcons) {
+                dirty = true;
+            } else if (validFrame && !dirty) {
+                if (desktopPopupGlass) scheduleDesktopPopupPump();
+                return true;
+            }
         }
 
-        capture(root, target, taskMenuScaleSettling || dirty);
+        capture(root, target, taskMenuScaleSettling || desktopPopupSettling || dirty);
         if (taskMenuScaleSettling && validFrame) {
             taskMenuScaleSettling = false;
+        }
+        if (desktopPopupGlass) {
+            desktopPopupSettling = true;
+            scheduleDesktopPopupPump();
+        } else if (desktopPopupSettling && desktopPopupHasIcons) {
+            desktopPopupSettling = false;
         }
         dirty = false;
         return true;
@@ -491,6 +703,7 @@ import java.util.WeakHashMap;
         boolean complete = false;
         boolean dragGlass = overlaySourceOf(target) != null && dragViewAncestor(target) != null;
         int seedGen = dragSeedGeneration;
+        PopupScaleSnapshot popupScaleSnap = null;
         try {
             int viewW = target.getWidth();
             int viewH = target.getHeight();
@@ -504,21 +717,89 @@ import java.util.WeakHashMap;
             canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR);
             canvas.save();
             canvas.scale(scale, scale);
-            translateRootToTarget(root, target, canvas);
-            drawWallpaper(root, canvas);
             View overlaySeed = overlaySourceOf(target);
             boolean taskGlass = TaskContentOverlay.isTaskView(overlaySeed);
-            if (dragGlass) {
-                // Never hide *DragView during drag capture — that flickers the preview.
-                canvas.restore();
-                canvas.save();
-                canvas.scale(scale, scale);
+            boolean desktopPopupGlass = isDesktopPopupGlass(target);
+            if (dragGlass || desktopPopupGlass) {
+                // Shared path: wallpaper under glass, then paintIntoTargetLocal icons.
+                // Options menu open anim scales the host (<1). Pure window translate maps
+                // layout-sized sample past the screen edge → CLEAR → black (vibrant a=1).
+                // Use the full root→target matrix so wallpaper matches icon sampling —
+                // keep live scale so open-anim frames track the background (do NOT always
+                // normalize to 1 — that froze every frame as the fully-open picture).
+                if (desktopPopupGlass) {
+                    if (!concatRootToTarget(root, target, canvas)) {
+                        translateRootToTarget(root, target, canvas);
+                    }
+                } else {
+                    translateRootToTarget(root, target, canvas);
+                }
                 try {
-                    DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
+                    drawWallpaper(root, canvas);
                 } catch (Throwable ignored) {
                 }
                 canvas.restore();
+                canvas.save();
+                canvas.scale(scale, scale);
+                boolean iconsPainted = false;
+                try {
+                    // Fully open: drop APP_SNAPS so 角标 refresh. During open, keep snaps —
+                    // mid-release HW re-snap often fails and would refuse to publish (= freeze
+                    // that overrides continuous open-anim sampling).
+                    if (desktopPopupGlass && !isDesktopPopupOpening(target)) {
+                        DesktopIconOverlay.clearAppSnaps();
+                    }
+                    iconsPainted = DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
+                } catch (Throwable ignored) {
+                }
+                canvas.restore();
+                // Early open (scale≈0) or singular matrix: one identity-scale retry only.
+                // Never mutate scale while the OEM open spring runs — setScaleX/Y(1) fights
+                // LauncherAnimUtils.SCALE_PROPERTY and cancels Cos14/16 open anim.
+                // Never normalize while More-functions holds the primary plate at ~0.9.
+                boolean openingPopup = isDesktopPopupOpening(target);
+                if (desktopPopupGlass && !iconsPainted && !moreFunctionsSubMenuActive
+                        && !openingPopup) {
+                    popupScaleSnap = PopupScaleSnapshot.captureAndNormalize(target);
+                    if (popupScaleSnap != null) {
+                        canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR);
+                        canvas.save();
+                        canvas.scale(scale, scale);
+                        if (!concatRootToTarget(root, target, canvas)) {
+                            translateRootToTarget(root, target, canvas);
+                        }
+                        try {
+                            drawWallpaper(root, canvas);
+                        } catch (Throwable ignored) {
+                        }
+                        canvas.restore();
+                        canvas.save();
+                        canvas.scale(scale, scale);
+                        try {
+                            DesktopIconOverlay.clearAppSnaps();
+                            iconsPainted = DesktopIconOverlay.paintIntoTargetLocal(target, canvas);
+                        } catch (Throwable ignored) {
+                        }
+                        canvas.restore();
+                    }
+                }
+                if (desktopPopupGlass) {
+                    if (iconsPainted) {
+                        complete = true;
+                        desktopPopupHasIcons = true;
+                    } else if ((moreFunctionsSubMenuActive || openingPopup)
+                            && isMeaningful(backBitmap)) {
+                        // Open / submenu reveal: publish wallpaper under glass without
+                        // normalize-scale so OEM spring stays intact.
+                        complete = true;
+                    } else {
+                        complete = false;
+                        dirty = true;
+                    }
+                }
             } else if (taskGlass) {
+                translateRootToTarget(root, target, canvas);
+                drawWallpaper(root, canvas);
                 // Wallpaper already sampled above. Blit task thumbnail / protect mask only —
                 // never software-draw the full launcher tree (severe frame drops).
                 canvas.restore();
@@ -530,6 +811,8 @@ import java.util.WeakHashMap;
                 }
                 canvas.restore();
             } else if (BehindDisplayCapture.isSysUiMenuGlass(target)) {
+                translateRootToTarget(root, target, canvas);
+                drawWallpaper(root, canvas);
                 // Float/split app-options: sample composited content under the popup
                 // (exclude popup SurfaceControl) — not wallpaper alone.
                 canvas.restore();
@@ -545,9 +828,13 @@ import java.util.WeakHashMap;
                 }
                 canvas.restore();
             } else if (isWallpaperOnlyGlass(target)) {
+                translateRootToTarget(root, target, canvas);
+                drawWallpaper(root, canvas);
                 // RapidReaction capsules sit under the live app: desktop/wallpaper only.
                 canvas.restore();
             } else {
+                translateRootToTarget(root, target, canvas);
+                drawWallpaper(root, canvas);
                 View dragView = dragViewAncestor(target);
                 float oldDragAlpha = dragView == null ? 1f : dragView.getAlpha();
                 owner.setAlpha(0f);
@@ -560,18 +847,25 @@ import java.util.WeakHashMap;
                 }
                 canvas.restore();
             }
-            boolean wallpaperOnly = isWallpaperOnlyGlass(target);
-            boolean behindScreen = BehindDisplayCapture.isSysUiMenuGlass(target);
-            boolean seedChanged = dragGlass && seedGen != publishedDragSeedGeneration;
-            complete = isMeaningful(backBitmap)
-                    || (forced && !validFrame)
-                    || (dragGlass && (forced || seedChanged))
-                    || (taskGlass && forced)
-                    || (wallpaperOnly && forced)
-                    || (behindScreen && forced);
+            if (!desktopPopupGlass) {
+                boolean wallpaperOnly = isWallpaperOnlyGlass(target);
+                boolean behindScreen = BehindDisplayCapture.isSysUiMenuGlass(target);
+                boolean seedChanged = dragGlass && seedGen != publishedDragSeedGeneration;
+                complete = isMeaningful(backBitmap)
+                        || (forced && !validFrame)
+                        || (dragGlass && (forced || seedChanged))
+                        || (taskGlass && forced)
+                        || (wallpaperOnly && forced)
+                        || (behindScreen && forced);
+            }
         } catch (Throwable ignored) {
             // Keep the previous useful frame.
         } finally {
+            if (popupScaleSnap != null) {
+                try {
+                    popupScaleSnap.restore();
+                } catch (Throwable ignored) { }
+            }
             owner.setAlpha(oldAlpha);
             recording = false;
         }
@@ -750,6 +1044,64 @@ import java.util.WeakHashMap;
         return tag instanceof String && ((String) tag).startsWith("colg_rapid_");
     }
 
+    /** Desktop long-press options menu panels ({@code colg_desktop_popup}). */
+    /**
+     * Temporarily force identity scale on the popup chain so {@code transformMatrixToGlobal}
+     * matches a settled menu during open (scale≈0…1). Restored after the sample.
+     */
+    private static final class PopupScaleSnapshot {
+        private final View[] views;
+        private final float[] scaleX;
+        private final float[] scaleY;
+
+        private PopupScaleSnapshot(View[] views, float[] scaleX, float[] scaleY) {
+            this.views = views;
+            this.scaleX = scaleX;
+            this.scaleY = scaleY;
+        }
+
+        static PopupScaleSnapshot captureAndNormalize(View target) {
+            java.util.ArrayList<View> views = new java.util.ArrayList<>();
+            java.util.ArrayList<Float> sx = new java.util.ArrayList<>();
+            java.util.ArrayList<Float> sy = new java.util.ArrayList<>();
+            for (View current = target; current != null; ) {
+                float x = current.getScaleX();
+                float y = current.getScaleY();
+                if (Math.abs(x - 1f) > 1e-3f || Math.abs(y - 1f) > 1e-3f) {
+                    views.add(current);
+                    sx.add(x);
+                    sy.add(y);
+                    current.setScaleX(1f);
+                    current.setScaleY(1f);
+                }
+                ViewParent parent = current.getParent();
+                if (!(parent instanceof View)) break;
+                current = (View) parent;
+            }
+            if (views.isEmpty()) return null;
+            View[] v = views.toArray(new View[0]);
+            float[] ox = new float[v.length];
+            float[] oy = new float[v.length];
+            for (int i = 0; i < v.length; i++) {
+                ox[i] = sx.get(i);
+                oy[i] = sy.get(i);
+            }
+            return new PopupScaleSnapshot(v, ox, oy);
+        }
+
+        void restore() {
+            for (int i = 0; i < views.length; i++) {
+                views[i].setScaleX(scaleX[i]);
+                views[i].setScaleY(scaleY[i]);
+            }
+        }
+    }
+
+    private static boolean isDesktopPopupGlass(View target) {
+        Object tag = target == null ? null : target.getTag();
+        return "colg_desktop_popup".equals(tag);
+    }
+
     private void attach(View root) {
         if (observerAttached) return;
         ViewTreeObserver observer = root.getViewTreeObserver();
@@ -777,6 +1129,14 @@ import java.util.WeakHashMap;
         frontBitmap = null;
         backBitmap = null;
         validFrame = false;
+        desktopPopupSettling = false;
+        desktopPopupHasIcons = false;
+        desktopPopupOpenAnimActive = false;
+        desktopPopupPumpPosted = false;
+        try {
+            Choreographer.getInstance().removeFrameCallback(desktopPopupPump);
+        } catch (Throwable ignored) { }
+        taskMenuScaleSettling = false;
     }
 
     private static void recycle(Bitmap bitmap) {
